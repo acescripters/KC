@@ -135,10 +135,10 @@ class MinahBot:
         self.port = 6668
         # self.nick = "minah"
         # self.username = "NPC"
-        self.realname = "꧁✿🌸Hidup Anugerah Terindah🌸✿꧂"
+        # self.realname = "꧁✿🌸Hidup Anugerah Terindah🌸✿꧂"
 
         # Channels list
-        self.channels = ['#amboi','#ace', '#zumba', '#alamanda', '#bro', '#desa', '#purple', '#bro']
+        # self.channels = ['#amboi','#ace', '#zumba', '#alamanda', '#bro', '#desa', '#purple', '#bro']
 
         # AI API Configuration (GROQ)
         self.api_key = "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"
