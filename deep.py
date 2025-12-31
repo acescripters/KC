@@ -1,1345 +1,1613 @@
-import sys
-import os
-
-# ==================== NIX/REPLIT ENVIRONMENT FIX ====================
-# Add user site-packages directory
-user_site = None
-try:
-    import site
-    user_site = site.getusersitepackages()
-    if user_site and os.path.exists(user_site):
-        sys.path.insert(0, user_site)
-        print(f"🔧 Added user site: {user_site}")
-except:
-    pass
-
-# Common Replit paths
-replit_paths = [
-    '/home/runner/.local/lib/python3.9/site-packages',
-    '/home/runner/.local/lib/python3.8/site-packages',
-    os.path.expanduser('~/.local/lib/python3.9/site-packages'),
-    os.path.expanduser('~/.local/lib/python3.8/site-packages'),
-    '/tmp/pip-target/lib/python3.9/site-packages',
-]
-
-for path in replit_paths:
-    if os.path.exists(path):
-        sys.path.insert(0, path)
-        print(f"🔧 Added path: {path}")
-
-# Try to import requests
-try:
-    import requests
-    print(f"✅ requests: {requests.__version__}")
-except ImportError:
-    print("❌ requests not found. Attempting to install...")
-
-    # Try to install to temp directory
-    import subprocess
-    import tempfile
-
-    # Create temp directory for installation
-    temp_dir = tempfile.mkdtemp(prefix='pip_')
-
-    try:
-        # Install to temp directory
-        cmd = [sys.executable, "-m", "pip", "install", "--target", temp_dir, "requests"]
-        print(f"💻 Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-
-        if result.returncode == 0:
-            sys.path.insert(0, temp_dir)
-            import requests
-            print(f"✅ requests installed to temp directory: {temp_dir}")
-        else:
-            print(f"⚠️  pip install failed: {result.stderr[:200]}")
-
-            # Fallback: Use urllib
-            print("🔄 Falling back to urllib...")
-            import urllib.request
-            import json as json_module
-
-            class DummyRequests:
-                @staticmethod
-                def get(url, timeout=10):
-                    try:
-                        req = urllib.request.Request(url)
-                        with urllib.request.urlopen(req, timeout=timeout) as response:
-                            text = response.read().decode('utf-8')
-                            return type('Response', (), {
-                                'status_code': response.status,
-                                'text': text,
-                                'json': lambda: json_module.loads(text) if text.strip() else {}
-                            })()
-                    except Exception as e:
-                        print(f"⚠️  HTTP request failed: {e}")
-                        return type('Response', (), {
-                            'status_code': 500,
-                            'text': '{}',
-                            'json': lambda: {}
-                        })()
-
-            requests = DummyRequests
-            print("✅ Created requests fallback using urllib")
-
-    except Exception as e:
-        print(f"❌ Installation failed: {e}")
-        # Create dummy requests
-        requests = None
-
-# Now continue with other imports
-# ==================== REST OF YOUR BOT CODE ====================
-#!/usr/bin/env python3
+import re
 import socket
 import time
-import requests
-from collections import deque
-import re
 import random
-import http.client
-import json
-import urllib.parse
+import requests
+import datetime as dt
+from collections import deque
 
-# ==================== KONFIGURASI ====================
-SERVER = "irc.kampungchat.org"
-PORT = 6668
-NICK = "deep"
-CHANNELS = ["#ace", "#amboi", "#desa", "#alamanda", "#bro"]
-PASSWORD = "ace:123456"
-GROQ_API_KEY = "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"
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-# ==================== GENIUS AI SYSTEM ====================
-class GeniusAIBot:
+# ===== VERIFIED SEARCH ENGINE =====
+class VerifiedSearchEngine:
     def __init__(self):
-        self.focus_users = {}
-        self.silent_users = {}
-        self.conversation_memory = {}
-        self.last_response_time = {}
-        self.processed_messages = set()
-        self.current_processing = None
-        self.current_processing_user = None
-        self.last_search_data = {}
-        self.last_search_query = {}
-        self.channel_topics = {}
-        self.used_facts = {}
-        self.nick_history = {}
-
-        # 🆕 CRITICAL FIX: User-specific tracking
-        self.user_contexts = {}
-        self.last_interaction = {}
-        self.nick = NICK  # 🆕 ADD FOR NICK DETECTION
-
-        # 🆕 STATIC RESPONSE SYSTEM - ORGANIZED
-        self.static_response_sets = {
-            "greeting_responses": [
-                "Hai {user}! Ada apa yang boleh saya bantu? 😊",
-                "Hey {user}! Apa khabar? 👋", 
-                "Hello {user}! Sedia membantu! 🎯",
-                "Hi {user}! Bagaimana hari anda? 🙂",
-                "Hai {user}! Ada soalan untuk saya? 🤔"
-            ],
-
-            "confusion_responses": [
-                "Boleh terangkan dengan lebih jelas?",
-                "Tak berapa faham, boleh huraikan?",
-                "Maksud kamu apa sebenarnya?",
-                "Beri saya lebih context.",
-                "Boleh kamu jelaskan?",
-                "Tak pasti saya tangkap maksud.",
-                "Boleh ulaskan dengan cara lain?",
-                "Apa point yang nak disampaikan?",
-                "Jelas sedikit, saya cuba fahami.",
-                "Nak saya faham dari sudut mana?"
-            ],
-
-            "repair_responses": [
-                "Sedang dalam proses pembaikan! ⚡",
-                "Sistem sedang dioptimalkan. 🔧",
-                "Proses upgrade sedang berjalan. 🚀",
-                "Maintenance routine aktif. 📊",
-                "Update sistem dalam progres. 🔄"
-            ],
-
-            "general_responses": [
-                "Faham, teruskan.",
-                "Okay, saya dengar.",
-                "Jelas, apa next?",
-                "Noted, ada lagi?",
-                "Roger that!",
-                "Copy that!",
-                "Acknowledged.",
-                "Loud and clear!",
-                "Terima kasih inputnya.",
-                "Appreciate the feedback."
-            ],
-
-            "followup_responses": [
-                "Nak maklumat tambahan? Cuba `!more`.",
-                "Ada soalan lain? Sedia bantu!",
-                "Mau teruskan dengan topik lain?",
-                "Nak explore lebih lanjut?",
-                "Ada aspek khusus yang nak ditanya?",
-                "Saya sedia dengan soalan seterusnya!",
-                "Apa yang kamu nak tahu seterusnya?",
-                "Ready untuk soalan berikutnya!",
-                "Ada input atau soalan tambahan?",
-                "Mau bincang perkara lain?"
-            ]
+        self.sources = {
+            'wikipedia_ms': {
+                'name': 'Wikipedia Bahasa Malaysia',
+                'url': 'https://ms.wikipedia.org/w/api.php',
+                'verified': True
+            },
+            'wikipedia_en': {
+                'name': 'Wikipedia English',
+                'url': 'https://en.wikipedia.org/w/api.php', 
+                'verified': True
+            },
+            'weather_gov': {
+                'name': 'OpenWeatherMap',
+                'url': 'https://api.openweathermap.org/data/2.5/weather',
+                'verified': True,
+                'api_key': '00d5ea501cfab4ca390219973dd4c9f9'  # Anda perlu dapatkan API key
+            },
+            'news_api': {
+                'name': 'NewsAPI',
+                'url': 'https://newsapi.org/v2/everything',
+                'verified': True,
+                'api_key': '0a4985db05f24db892bb1588f153a148'  # Anda perlu dapatkan API key
+            },
+            'bmkg': {
+                'name': 'BMKG Indonesia',
+                'url': 'https://data.bmkg.go.id/',
+                'verified': True
+            },
+            'gov_my': {
+                'name': 'Portal Data Terbuka Malaysia',
+                'url': 'https://data.gov.my/',
+                'verified': True
+            }
         }
 
-        self.response_indices = {}
+        print("🔍 Verified Search Engine Initialized")
+        print("📚 Sources: Wikipedia, BMKG, OpenWeatherMap, NewsAPI")
 
-    # 🆕 GOOGLE TRANSLATE API SYSTEM
-    def translate_indonesia_to_malaysia(self, text):
-        """Gunakan Google Translate API untuk terjemahan tepat"""
+    def search_wikipedia(self, query, lang='ms'):
+        """🔍 Search Wikipedia dengan source verification"""
         try:
-            # 🎯 GUNA GOOGLE TRANSLATE API
-            encoded_text = urllib.parse.quote(text)
+            source = self.sources['wikipedia_ms'] if lang == 'ms' else self.sources['wikipedia_en']
 
-            # Google Translate API endpoint
-            conn = http.client.HTTPSConnection("translate.googleapis.com")
-            url = f"/translate_a/single?client=gtx&sl=id&tl=ms&dt=t&q={encoded_text}"
-
-            conn.request("GET", url)
-            response = conn.getresponse()
-            data = response.read().decode('utf-8')
-            conn.close()
-
-            # Parse response JSON
-            translated_data = json.loads(data)
-
-            # Extract translated text
-            if translated_data and len(translated_data) > 0:
-                translated_text = ""
-                for item in translated_data[0]:
-                    if item[0]:  # Translated text
-                        translated_text += item[0]
-
-                if translated_text and translated_text != text:
-                    print(f"🔤 Google Translate: '{text}' -> '{translated_text}'")
-                    return translated_text
-
-            # Fallback ke common words replacement
-            return self.simple_translation_fallback(text)
-
-        except Exception as e:
-            print(f"⚠️ Google Translate error: {e}")
-            # Fallback ke simple translation
-            return self.simple_translation_fallback(text)
-
-    def simple_translation_fallback(self, text):
-        """Simple common words replacement fallback"""
-        common_translations = {
-            'aku': 'saya', 'kamu': 'awak', 'gue': 'saya', 'lu': 'awak',
-            'mau': 'nak', 'pengen': 'nak', 'bisa': 'boleh',
-            'lihat': 'tengok', 'tonton': 'tengok', 'saksikan': 'tengok',
-            'keren': 'menarik', 'gaya': 'style', 'mantap': 'hebat',
-            'nanti': 'sebentar', 'sih': '', 'deh': '', 'dong': '',
-            'ayo': 'jom', 'yuk': 'jom', 'sini': 'sini', 'sana': 'sana',
-            'apa kabar': 'apa khabar', 'bagaimana': 'macam mana',
-            'kenapa': 'kenapa', 'karena': 'sebab', 'sebab': 'sebab'
-        }
-
-        # Simple word replacement untuk common terms
-        result = text
-        for id_word, my_word in common_translations.items():
-            if my_word:  # Only replace if not empty
-                result = re.sub(r'\b' + re.escape(id_word) + r'\b', my_word, result, flags=re.IGNORECASE)
-
-        if result != text:
-            print(f"🔤 Simple Translate: '{text}' -> '{result}'")
-
-        return result
-
-    def detect_indonesia_language(self, text):
-        """Detect Bahasa Indonesia patterns"""
-        indonesia_indicators = [
-            'apa kabar', 'bisa', 'mau', 'pengen', 'gue', 'lu', 
-            'saksikan', 'keren', 'gaya', 'mantap', 'sih', 'deh', 'dong',
-            'ayo', 'yuk', 'karena'
-        ]
-
-        text_lower = text.lower()
-        return any(indicator in text_lower for indicator in indonesia_indicators)
-
-    # 🆕 SERVER TRANSLATION COMMAND HANDLER
-    def handle_translation_commands(self, nick, channel, message):
-        """Handle server translation commands jika ada"""
-        if message.startswith('!translate') or message.startswith('/translate'):
-            # Server translation command format: !translate id ms <text>
-            parts = message.split(' ', 3)
-            if len(parts) >= 4:
-                source_lang, target_lang, text_to_translate = parts[1], parts[2], parts[3]
-                if source_lang == 'id' and target_lang == 'ms':
-                    translated = self.translate_indonesia_to_malaysia(text_to_translate)
-                    return f"🔤 Terjemahan: {translated}"
-        return None
-
-    # 🆕 SINGLE UNIFIED PROMPT SYSTEM
-    def unified_genius_response(self, message, context_type, search_data="", memory_context="", username=""):
-        """SINGLE PROMPT SYSTEM dengan server-based translation"""
-
-        # 🎯 SINGLE MASTER PROMPT - Arahkan guna Bahasa Malaysia terus
-        master_prompt = f"""
-# GENIUS AI BOT - BAHASA MALAYSIA MODE
-# GUNA BAHASA MALAYSIA SAHAJA (bukan Indonesia)
-
-CONTEXT: {context_type}
-USER: {username}
-MEMORY: {memory_context}
-SEARCH_DATA: {search_data}
-MESSAGE: {message}
-
-INSTRUCTIONS:
-1. 🎯 GUNA BAHASA MALAYSIA - Malaysian Malay, bukan Indonesian
-2. 🚀 Response pendek & relevant (max 4 baris, 200 chars)
-3. 📝 Natural conversation style
-4. ❌ JANGAN guna Bahasa Indonesia
-
-CONTOH BAHASA MALAYSIA:
-- "Hai! Ada apa?" (bukan "Hai! Apa kabar?")
-- "Saya boleh bantu" (bukan "Saya bisa bantu")  
-- "Nak tengok?" (bukan "Mau lihat?")
-- "Bagaimana boleh saya bantu?" (bukan "Bagaimana bisa saya bantu?")
-
-RESPONSE BAHASA MALAYSIA:
-"""
-
-        response = self.call_groq(master_prompt, timeout=8)
-
-        if response:
-            response = response.strip()
-            # Clean response
-            response = re.sub(r'\s+', ' ', response)
-            response = response.replace('"', '').replace('**', '')
-
-            # 🎯 SERVER-BASED TRANSLATION CHECK
-            # Biar server handle complex translation
-            if self.detect_indonesia_language(response):
-                print(f"🔍 Detected Indonesian: {response}")
-                response = self.translate_indonesia_to_malaysia(response)
-
-            # 🎯 HARDCODED BAHASA MALAYSIA RESPONSES UNTUK COMMON CASES
-            if context_type == "GREETING":
-                malay_greetings = [
-                    "Hai! Ada apa yang boleh saya bantu? 😊",
-                    "Hello! Sedia membantu! 🎯", 
-                    "Hi! Apa khabar? 👋",
-                    "Hai! Bagaimana hari anda? 🙂"
-                ]
-                if any(indonesian_word in response.lower() for indonesian_word in ['apa kabar', 'bisa', 'mau']):
-                    response = random.choice(malay_greetings)
-
-        return response or "Sistem sedang..."
-
-    def clean_irc_message(self, message):
-        """Clean IRC message dari formatting codes"""
-        message = re.sub(r'\x03(\d{1,2}(,\d{1,2})?)?', '', message)
-
-        formatting_codes = ['\x02', '\x1D', '\x1F', '\x16', '\x0F']
-        for code in formatting_codes:
-            message = message.replace(code, '')
-
-        message = message.replace('\xa0', ' ')
-
-        message = re.sub(r'\s+', ' ', message).strip()
-
-        return message
-
-    def detect_nick_mentions(self, message):
-        """Convert dari mIRC: Detect nick mentions dalam message"""
-        cleaned_message = message.replace('\xa0', ' ')
-
-        prefix_chars = ['@', '+', '%', '&', '~']
-        for prefix in prefix_chars:
-            cleaned_message = cleaned_message.replace(prefix, '')
-
-        words = cleaned_message.split()
-
-        if self.nick.lower() in [word.lower() for word in words]:
-            return True
-
-        if 'bot' in [word.lower() for word in words]:
-            return True
-
-        return False
-
-    def detect_nick_mentions_advanced(self, message):
-        """Advanced version dengan regex untuk better detection"""
-        cleaned_message = self.clean_irc_message(message)
-
-        words = re.findall(r'\b\w+\b', cleaned_message.lower())
-
-        if self.nick.lower() in words:
-            return True
-
-        bot_keywords = ['bot', 'bots', 'robot', 'ai', 'assistant']
-        if any(bot_word in words for bot_word in bot_keywords):
-            return True
-
-        command_patterns = [
-            r'^!cari\b', r'^!more\b', r'^!next\b',
-            r'^cari\b', r'^search\b', r'^find\b'
-        ]
-
-        if any(re.search(pattern, cleaned_message, re.IGNORECASE) for pattern in command_patterns):
-            return True
-
-        return False
-
-    def is_mention(self, message):
-        """FIXED: Gunakan advanced nick detection"""
-        return self.detect_nick_mentions_advanced(message)
-
-    def is_message_for_bot(self, message, username):
-        """FIXED: Smart detection untuk tahu sama ada message untuk bot atau user lain"""
-        message_lower = message.lower()
-
-        # 🆕 FIX: JANGAN treat commands sebagai mentions
-        if message.strip() in ['!more', '!next', '!cari']:
-            return True
-
-        if self.detect_nick_mentions_advanced(message):
-            return True
-
-        command_patterns = [
-            r'^!cari\b', r'^!more\b', r'^!next\b',
-            r'^cari\b', r'^search\b', r'^find\b'
-        ]
-
-        if any(re.search(pattern, message_lower) for pattern in command_patterns):
-            return True
-
-        if self.is_in_focus(username):
-            return True
-
-        mentioned_users = re.findall(r'@?(\w+)', message_lower)
-        if mentioned_users:
-            valid_users = [
-                user for user in mentioned_users 
-                if user not in [self.nick.lower(), 'www', 'minah', 'bot'] 
-                and len(user) > 2
-                and user != username.lower()
-            ]
-            if valid_users:
-                return False
-
-        return False
-
-    def is_message_for_other_user(self, message):
-        """Better detection untuk messages antara users"""
-        message_lower = message.lower()
-
-        user_convo_patterns = [
-            r'tq\s+\w+', r'thanks\s+\w+', r'thank you\s+\w+',
-            r'terima kasih\s+\w+', 
-            r'\w+\s+from where', r'\w+\s+dari mana',
-            r'ko dari mana', r'awak dari mana', r'hang dari mana',
-            r'same2\s+\w+', r'sama2\s+\w+',
-            r'welcome\s+\w+', r'selamat datang\s+\w+'
-        ]
-
-        if any(re.search(pattern, message_lower) for pattern in user_convo_patterns):
-            return True
-
-        mentioned_users = re.findall(r'@?(\w+)', message_lower)
-        if mentioned_users:
-            valid_users = [
-                user for user in mentioned_users 
-                if user not in [self.nick.lower(), 'www', 'bot', 'bots', 'deep']
-                and len(user) > 2
-            ]
-            if len(valid_users) >= 1:
-                return True
-
-        return False
-
-    def get_user_context(self, username):
-        """Dapatkan context khusus untuk user"""
-        if username not in self.user_contexts:
-            self.user_contexts[username] = {
-                'last_topic': '',
-                'conversation_count': 0,
-                'last_response': '',
-                'interaction_time': time.time()
-            }
-        return self.user_contexts[username]
-
-    def update_user_context(self, username, message, response):
-        """Update user context dengan accurate"""
-        context = self.get_user_context(username)
-        context['last_response'] = response
-        context['interaction_time'] = time.time()
-        context['conversation_count'] += 1
-
-        words = message.lower().split()
-        topic_keywords = ['otak', 'repair', 'operasi', 'bateri', 'menteri', 'search', 'cari', 'gaza']
-        for word in words:
-            if word in topic_keywords:
-                context['last_topic'] = word
-                break
-
-    def get_static_response(self, username, response_type):
-        """Static response dengan user context"""
-        if username not in self.response_indices:
-            self.response_indices[username] = {}
-
-        if response_type not in self.response_indices[username]:
-            self.response_indices[username][response_type] = 0
-
-        response_set = self.static_response_sets.get(response_type, ["Faham."])
-        current_index = self.response_indices[username][response_type]
-        response = response_set[current_index % len(response_set)]
-
-        response = response.replace("{user}", username)
-
-        self.response_indices[username][response_type] = (current_index + 1) % len(response_set)
-        return response
-
-    def detect_response_type(self, message):
-        """Better response type detection"""
-        message_lower = message.lower()
-
-        if any(word in message_lower for word in ['hai', 'hello', 'hi', 'hey', 'halo', 'welcome']):
-            return "greeting_responses"
-        elif any(word in message_lower for word in ['tak faham', 'tak jelas', 'apa maksud', 'kenapa', 'pelik']):
-            return "confusion_responses"
-        elif any(word in message_lower for word in ['repair', 'baiki', 'otak', 'senget', 'operasi']):
-            return "repair_responses"
-        elif any(word in message_lower for word in ['tu je?', 'jem lagi?', 'lagi?', 'next', 'sambung', 'kamu la next']):
-            return "followup_responses"
-        else:
-            return "general_responses"
-
-    def cleanup_memory(self, username):
-        """Smart memory management"""
-        if username in self.conversation_memory:
-            current_memory = list(self.conversation_memory[username])
-            if len(current_memory) >= 30:
-                new_memory = current_memory[-15:]
-                self.conversation_memory[username] = deque(new_memory, maxlen=30)
-
-    def update_memory(self, username, user_message, bot_response):
-        """Memory update dengan user context"""
-        if username not in self.conversation_memory:
-            self.conversation_memory[username] = deque(maxlen=20)
-
-        if bot_response and len(bot_response) > 10:
-            if self.conversation_memory[username]:
-                last_entry = self.conversation_memory[username][-1]
-                if bot_response in last_entry:
-                    return
-
-        self.conversation_memory[username].append(f"USER: {user_message}")
-        self.conversation_memory[username].append(f"AI: {bot_response}")
-
-        self.update_user_context(username, user_message, bot_response)
-
-        if len(self.conversation_memory[username]) >= 20:
-            self.cleanup_memory(username)
-
-    def get_memory_context(self, username):
-        """Memory context yang lebih focused"""
-        if username not in self.conversation_memory or not self.conversation_memory[username]:
-            return "TIADA HISTORY"
-
-        memory_lines = list(self.conversation_memory[username])[-4:]
-
-        context_lines = []
-        for line in memory_lines:
-            clean_line = re.sub(r'^(USER|AI):\s*', '', line)
-            if len(clean_line) > 5:
-                context_lines.append(clean_line)
-
-        return " | ".join(context_lines[-3:])
-
-    def extract_mentioned_user(self, message):
-        """Extract username"""
-        clean_message = re.sub(r'\b' + re.escape(self.nick) + r'\b', '', message, flags=re.IGNORECASE)
-        clean_message = clean_message.strip()
-
-        if clean_message:
-            words = clean_message.split()
-            if words:
-                return words[0]
-
-        return "kawan"
-
-    def call_groq(self, prompt, timeout=10):
-        """Panggil Groq AI"""
-        try:
-            messages = [{"role": "user", "content": prompt}]
-
-            payload = {
-                "model": "llama-3.1-8b-instant",
-                "messages": messages,
-                "max_tokens": 350,
-                "temperature": 0.7,
-                "top_p": 1,
-                "stream": False
-            }
-
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            }
-
-            response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
-
-            if response.status_code == 200:
-                data = response.json()
-                ai_text = data['choices'][0]['message']['content'].strip()
-                return ai_text
-            else:
-                return "🤖 Sistem sementara unavailable."
-
-        except Exception as e:
-            return "⏳ Timeout. Cuba lagi."
-
-    def should_use_action_response(self):
-        """Kurangkan frequency action response"""
-        return random.random() < 0.15
-
-    def is_math_question(self, message):
-        """Mathematical reasoning detection"""
-        math_keywords = ['+', '-', '*', 'x', 'darab', 'bahagi', 'tambah', 'tolak', '=', 'berapa']
-        message_lower = message.lower()
-
-        has_math_operator = any(op in message_lower for op in ['+', '-', '*', 'x', 'darab', 'bahagi'])
-        has_math_keyword = any(keyword in message_lower for keyword in ['berapa', 'kira', 'hitung'])
-
-        return has_math_operator or has_math_keyword
-
-    def calculate_math(self, message):
-        """Mathematical computation"""
-        try:
-            calc_msg = message.lower()
-            calc_msg = calc_msg.replace('darab', '*').replace('x', '*')
-            calc_msg = calc_msg.replace('tambah', '+').replace('tolak', '-')
-            calc_msg = calc_msg.replace('bahagi', '/').replace('÷', '/')
-
-            calc_msg = re.sub(r'[^\d\+\-\*\/\(\)\.\s]', ' ', calc_msg)
-            calc_msg = ' '.join(calc_msg.split())
-
-            if not calc_msg or len(calc_msg) < 3:
-                return None
-
-            result = eval(calc_msg)
-
-            if isinstance(result, float) and result.is_integer():
-                result = int(result)
-
-            return f"🔢 {message} = {result}"
-
-        except:
-            return None
-
-    def enforce_hard_200_limit(self, text):
-        """STRICT 180 CHARACTERS LIMIT"""
-        if len(text) <= 180:
-            return text
-
-        for delimiter in ['. ', '! ', '? ', '; ']:
-            pos = text[:160].rfind(delimiter)
-            if pos > 60:
-                return text[:pos + 1].strip()
-
-        space_pos = text[:150].rfind(' ')
-        if space_pos > 60:
-            return text[:space_pos].strip() + "..."
-
-        return text[:147].strip() + "..."
-
-    def get_greeting_response(self, mention_message, memory_context=""):
-        """Greeting response yang consistent"""
-        actual_username = self.extract_mentioned_user(mention_message)
-        return self.get_static_response(actual_username, "greeting_responses")
-
-    def activate_focus(self, username):
-        """Activate focus dengan timeout yang lebih pendek"""
-        self.focus_users[username] = time.time() + 180
-        self.silent_users.pop(username, None)
-        print(f"🎯 Focus activated for {username} for 3 minutes")
-
-    def is_in_focus(self, username):
-        """Check focus"""
-        if username in self.focus_users:
-            if time.time() < self.focus_users[username]:
-                return True
-            else:
-                del self.focus_users[username]
-                self.silent_users.pop(username, None)
-        return False
-
-    def should_search(self, message):
-        """Determine response type"""
-        message_lower = message.lower().strip()
-
-        current_user = getattr(self, 'current_processing_user', None)
-        if current_user and self.is_in_focus(current_user):
-            print(f"🎯 User {current_user} in focus")
-
-        if self.is_math_question(message):
-            math_result = self.calculate_math(message)
-            if math_result:
-                return "MATH"
-
-        if len(message_lower) < 5:
-            return "CHAT"
-
-        casual_phrases = ['ta de pe', 'dah tade org', 'uhuks', 'diam jap', 'ok', 'okay', 'baik', 'haha', 'hehe', 'lol']
-        if any(phrase in message_lower for phrase in casual_phrases):
-            return "CHAT"
-
-        search_triggers = [
-            'cari', 'carikan', 'search', 'google', 'berita', 'news', 'terkini',
-            'cuaca', 'weather', 'harga', 'price', 'fakta', 'fact', 'data',
-            'maklumat', 'information', 'info', '!cari', 'siapa', 'apa', 'bila'
-        ]
-
-        if any(trigger in message_lower for trigger in search_triggers):
-            return "SEARCH"
-
-        return "CHAT"
-
-    def google_search(self, query, timeout=12):
-        """Google Search dengan fallback"""
-        try:
-            clean_query = re.sub(r'^!cari\s*', '', query).strip()
-
-            url = "https://serpapi.com/search"
             params = {
-                'q': clean_query,
-                'api_key': "32840e0d0a550cf542792fcbe2d453baf5fe016b943c3117c743cbfc0d2be321",
-                'engine': 'google',
-                'num': 3,
-                'hl': 'ms',
-                'gl': 'my',
+                'action': 'query',
+                'format': 'json',
+                'list': 'search',
+                'srsearch': query,
+                'srlimit': 5,
+                'srprop': 'snippet|timestamp',
+                'utf8': 1
             }
 
-            response = requests.get(url, params=params, timeout=timeout)
+            response = requests.get(source['url'], params=params, timeout=10)
+
             if response.status_code == 200:
                 data = response.json()
-                search_results = []
+                results = data.get('query', {}).get('search', [])
 
-                if 'knowledge_graph' in data and data['knowledge_graph']:
-                    kg = data['knowledge_graph']
-                    title = kg.get('title', '')
-                    description = kg.get('description', '')
-                    if title and description:
-                        return f"📚 {title}: {description[:100]}... [!more]"
+                verified_results = []
+                for result in results:
+                    verified_results.append({
+                        'title': result['title'],
+                        'snippet': self.clean_html(result['snippet']),
+                        'source': source['name'],
+                        'timestamp': result.get('timestamp', ''),
+                        'url': f"https://{lang}.wikipedia.org/wiki/{result['title'].replace(' ', '_')}",
+                        'verified': True
+                    })
 
-                if 'organic_results' in data and data['organic_results']:
-                    for item in data['organic_results'][:2]:
-                        title = item.get('title', '')
-                        snippet = item.get('snippet', '')[:80]
+                return verified_results
 
-                        if title:
-                            result = f"🔍 {title}"
-                            if snippet:
-                                result += f" | {snippet}..."
-                            search_results.append(result)
+        except Exception as e:
+            print(f"❌ Wikipedia search error: {e}")
 
-                if search_results:
-                    return search_results[0]
-                else:
-                    fallbacks = {
-                        'menteri pelajaran': '📚 Menteri Pendidikan: Fadhina Sidek [!more]',
-                        'menteri pendidikan': '📚 Menteri Pendidikan Malaysia: Fadhina Sidek [!more]', 
-                        'perdana menteri': '📚 Perdana Menteri: Anwar Ibrahim [!more]',
-                        'ibu negara': '📚 Ibu negara: Kuala Lumpur [!more]',
-                        'gaza': '🌎 Gaza: Konflik Israel-Palestin sedang berlangsung [!more]'
+        return []
+
+    def get_weather(self, location):
+        """🌤️ Get weather data from verified source"""
+        try:
+            # Untuk Malaysia/Indonesia, kita boleh guna OpenWeatherMap atau BMKG
+            if 'kuala lumpur' in location.lower() or 'kl' in location.lower():
+                # Contoh untuk Kuala Lumpur
+                params = {
+                    'q': 'Kuala Lumpur, MY',
+                    'appid': self.sources['weather_gov']['api_key'],
+                    'units': 'metric',
+                    'lang': 'ms'
+                }
+
+                response = requests.get(
+                    self.sources['weather_gov']['url'], 
+                    params=params, 
+                    timeout=10
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    return {
+                        'location': data['name'],
+                        'temp': data['main']['temp'],
+                        'humidity': data['main']['humidity'],
+                        'description': data['weather'][0]['description'],
+                        'source': self.sources['weather_gov']['name'],
+                        'timestamp': dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'verified': True
                     }
 
-                    for key, value in fallbacks.items():
-                        if key in clean_query.lower():
-                            return value
-
-                    return f"📡 Maklumat '{clean_query}' sedang dikemas kini. [!more]"
-
-            return "🔍 Sistem carian sementara unavailable."
-
         except Exception as e:
-            return "🔍 Timeout carian. Cuba lagi."
-
-    def ai_analyze(self, user_question, search_data, memory_context=""):
-        """AI analysis dengan fix"""
-        if not search_data or "tidak dapat" in search_data or "ralat" in search_data or "unavailable" in search_data:
-            return f"🔍 Analisis untuk '{user_question}' sedang disiapkan. [!more]"
-        else:
-            response = self.unified_genius_response(user_question, "SEARCH", search_data, memory_context)
-
-        if not response or len(response.strip()) < 10:
-            response = f"📡 Maklumat untuk '{user_question}' sedang diproses. [!more]"
-
-        response = self.enforce_hard_200_limit(response)
-        return response
-
-    def handle_next_command(self, username, memory_context=""):
-        """Handle !next command"""
-        if username not in self.last_search_data:
-            return "❌ Tiada carian aktif. Cuba `cari [topic]` dulu."
-
-        search_data = self.last_search_data[username]
-        original_query = self.last_search_query.get(username, "")
-
-        if username not in self.used_facts:
-            self.used_facts[username] = []
-
-        response = self.unified_genius_response(original_query, "NEXT", search_data, memory_context)
-
-        simple_response = re.sub(r'\[!more\]|\[end\]', '', response).strip()
-        if any(simple_response in used for used in self.used_facts[username]):
-            return "🔄 Tiada maklumat baru. [end]"
-
-        self.used_facts[username].append(simple_response)
-        response = self.enforce_hard_200_limit(response)
-
-        return response
-
-    def get_chat_response(self, message, memory_context=""):
-        """Chat response dengan better context understanding"""
-        message_lower = message.lower()
-
-        if any(word in message_lower for word in ['tu je?', 'jem lagi?', 'lagi?', 'next', 'sambung']):
-            response = self.get_static_response(
-                getattr(self, 'current_processing_user', 'default'), 
-                "followup_responses"
-            )
-            # 🆕 AUTO-TRANSLATE STATIC RESPONSES
-            return self.translate_indonesia_to_malaysia(response) if self.detect_indonesia_language(response) else response
-
-        if 'kamu la next' in message_lower or 'you next' in message_lower:
-            return "😊 Okay! Saya sedia dengan soalan seterusnya. Apa yang kamu nak tahu?"
-
-        if any(word in message_lower for word in ['otak', 'repair', 'baiki', 'senget', 'operasi']):
-            response = self.get_static_response(
-                getattr(self, 'current_processing_user', 'default'), 
-                "repair_responses"
-            )
-            return self.translate_indonesia_to_malaysia(response) if self.detect_indonesia_language(response) else response
-
-        if any(word in message_lower for word in ['faham', 'okay', 'ok', 'baik', 'clear', 'jelas']):
-            response = self.get_static_response(
-                getattr(self, 'current_processing_user', 'default'),
-                "general_responses" 
-            )
-            return self.translate_indonesia_to_malaysia(response) if self.detect_indonesia_language(response) else response
-
-        # 🆕 GUNA SINGLE PROMPT SYSTEM
-        response = self.unified_genius_response(message, "CHAT", "", memory_context)
-
-        # 🆕 FINAL TRANSLATION CHECK
-        if self.detect_indonesia_language(response):
-            response = self.translate_indonesia_to_malaysia(response)
-
-        return response
-
-    def get_action_response(self, message, memory_context=""):
-        """Action response tanpa first person"""
-        neutral_actions = [
-            "processing information...",
-            "analyzing data...", 
-            "checking systems...",
-            "reviewing details...",
-            "updating records...",
-            "compiling report...",
-            "verifying information...",
-            "organizing data..."
-        ]
-        return random.choice(neutral_actions)
-
-    def get_nickchange_response(self, nick_change):
-        """Nick change response"""
-        try:
-            new_nick = nick_change.split(' to ')[1] if ' to ' in nick_change else "someone"
-            responses = [
-                f"noticed {new_nick} dengan identity baru! 🦸",
-                f"sees {new_nick} dengan fresh look! 😎",
-                f"spotted {new_nick} dalam bentuk baru! 🎭",
-                f"welcome {new_nick} dengan new vibes! 🌟"
-            ]
-            return random.choice(responses)
-        except:
-            return "noticed someone dengan new identity! 🎭"
-
-    def process_message(self, username, message, channel=None):
-        """Smart message processing dengan user conversation detection"""
-        current_time = time.time()
-
-        if hasattr(self, 'current_processing_user') and self.current_processing_user != username:
-            self.current_processing = None
-
-        self.current_processing_user = username
-
-        # 🆕 FIX: Handle translation commands first
-        translation_result = self.handle_translation_commands(username, channel or "", message)
-        if translation_result:
-            return translation_result
-
-        # 🆕 FIX: Handle commands properly - JANGAN treat sebagai greeting
-        if message.strip() in ['!more', '!next']:
-            if username not in self.last_search_data:
-                return "❌ Tiada carian aktif. Cuba `cari [topic]` dulu."
-
-            self.last_response_time[username] = current_time
-            self.current_processing = "NEXT"
-
-            memory_context = self.get_memory_context(username)
-            next_response = self.handle_next_command(username, memory_context)
-            return f"NEXT|{next_response}"
-
-        is_for_bot = self.is_message_for_bot(message, username)
-
-        print(f"🔍 Processing: {username} | For Bot: {is_for_bot} | Message: {message[:50]}...")
-
-        if not is_for_bot:
-            print(f"⏩ Skipping {username} - message not for bot")
-            return None
-
-        if self.is_math_question(message):
-            math_result = self.calculate_math(message)
-            if math_result:
-                return math_result
-
-        is_bot_mentioned = self.is_mention(message)
-        is_in_focus = self.is_in_focus(username)
-
-        if is_bot_mentioned:
-            self.activate_focus(username)
-            return "CONNECTING"
-
-        # 🆕 ONLY PROCESS JIKA MESSAGE UNTUK BOT
-        if not is_in_focus and not is_bot_mentioned:
-            message_lower = message.lower()
-            direct_interactions = [
-                'deep ', ' deep', '!cari',
-                'bot ', ' ai ', 'assistant'
-            ]
-
-            is_direct = any(interaction in message_lower for interaction in direct_interactions)
-
-            if is_direct:
-                print(f"🎯 Direct interaction from {username}, activating focus")
-                self.activate_focus(username)
-                return "CONNECTING"
-            else:
-                print(f"⏩ Skipping {username} - not in focus and not direct interaction")
-                return None
-
-        if self.is_message_for_other_user(message) and not is_in_focus:
-            print(f"⏩ Skipping {username} - message for other user")
-            return None
-
-        if self.current_processing:
-            print(f"⏩ Skipping {username} - currently processing")
-            return None
-
-        message_hash = f"{username}:{message}"
-        if message_hash in self.processed_messages:
-            print(f"⏩ Skipping {username} - duplicate message")
-            return None
-
-        if username in self.last_response_time:
-            time_since_last = current_time - self.last_response_time[username]
-            if time_since_last < 2:
-                print(f"⏩ Skipping {username} - too soon since last response")
-                return None
-
-        self.last_response_time[username] = current_time
-        self.processed_messages.add(message_hash)
-
-        if len(self.processed_messages) > 100:
-            self.processed_messages.clear()
-
-        if self.is_in_focus(username):
-            self.focus_users[username] = time.time() + 180
-
-            if message.lower() in ['diam', 'senyap', 'shut up', 'stop']:
-                self.silent_users[username] = True
-                return "🔇 Okay, saya diam."
-
-            if message.lower() in ['boleh cakap', 'cakap', 'speak']:
-                self.silent_users.pop(username, None)
-                return "🔊 Baik, saya sedia bantu!"
-
-            if username in self.silent_users:
-                return None
-
-            memory_context = self.get_memory_context(username)
-
-            action = self.should_search(message)
-
-            self.current_processing = action
-
-            if action in ["SEARCH", "ANALYSIS"]:
-                self.last_search_query[username] = message
-                if username in self.used_facts:
-                    self.used_facts[username] = []
-
-            if action == "SEARCH":
-                return f"SEARCH|{memory_context}"
-            elif action == "MATH":
-                return None
-            else:
-                return f"CHAT|{memory_context}"
+            print(f"❌ Weather API error: {e}")
 
         return None
 
-# ==================== IRC CLIENT ====================  
-class IRCClient:
-    def __init__(self):
-        self.sock = None
-        self.bot = GeniusAIBot()
-        self.last_global_response = 0
-        self.kicked_channels = {}
-
-    def connect(self):
+    def search_news(self, query, country='my'):
+        """📰 Search news from verified sources"""
         try:
+            if not self.sources['news_api']['api_key']:
+                return []
+
+            params = {
+                'q': query,
+                'apiKey': self.sources['news_api']['api_key'],
+                'pageSize': 5,
+                'language': 'ms' if country == 'my' else 'en',
+                'sortBy': 'relevancy'
+            }
+
+            response = requests.get(
+                self.sources['news_api']['url'],
+                params=params,
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                articles = data.get('articles', [])
+
+                verified_articles = []
+                for article in articles:
+                    # Filter untuk sumber yang verified
+                    source_name = article.get('source', {}).get('name', '')
+                    if self.is_verified_news_source(source_name):
+                        verified_articles.append({
+                            'title': article['title'],
+                            'description': article['description'],
+                            'url': article['url'],
+                            'source': source_name,
+                            'published': article['publishedAt'],
+                            'verified': True
+                        })
+
+                return verified_articles
+
+        except Exception as e:
+            print(f"❌ News API error: {e}")
+
+        return []
+
+    def is_verified_news_source(self, source_name):
+        """✅ Check if news source is verified"""
+        verified_sources = [
+            'Bernama', 'Astro Awani', 'Utusan Malaysia', 'The Star',
+            'New Straits Times', 'Malay Mail', 'Free Malaysia Today',
+            'BBC', 'CNN', 'Reuters', 'Al Jazeera'
+        ]
+
+        return any(vs.lower() in source_name.lower() for vs in verified_sources)
+
+    def clean_html(self, text):
+        """🧹 Clean HTML from snippets"""
+        if not text:
+            return ""
+
+        # Simple HTML tag removal
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    def search_all_sources(self, query):
+        """🔍 Search across all verified sources - FIXED"""
+        results = {
+            'wikipedia': [],
+            'news': [],
+            'weather': None,
+            'total_sources': 0,
+            'verified_count': 0
+        }
+
+        try:
+            # 1. Search Wikipedia
+            print(f"🔍 DEBUG: Searching Wikipedia...")
+            wiki_results = self.search_wikipedia(query)
+            results['wikipedia'] = wiki_results
+            results['total_sources'] += 1
+            results['verified_count'] += 1 if wiki_results else 0
+            print(f"🔍 DEBUG: Wikipedia results: {len(wiki_results)}")
+
+            # 2. Search News
+            news_keywords = ['berita', 'isu', 'terkini', 'viral', 'trending', 'hari ini']
+            if any(keyword in query.lower() for keyword in news_keywords):
+                print(f"🔍 DEBUG: Searching news...")
+                news_results = self.search_news(query)
+                results['news'] = news_results
+                results['total_sources'] += 1
+                results['verified_count'] += len(news_results)
+                print(f"🔍 DEBUG: News results: {len(news_results)}")
+
+            # 3. Check Weather
+            weather_keywords = ['cuaca', 'weather', 'hujan', 'panas', 'suhu']
+            if any(keyword in query.lower() for keyword in weather_keywords):
+                print(f"🔍 DEBUG: Getting weather...")
+                weather_data = self.get_weather(query)
+                results['weather'] = weather_data
+                if weather_data:
+                    results['total_sources'] += 1
+                    results['verified_count'] += 1
+                    print(f"🔍 DEBUG: Weather data: {weather_data.get('location', 'N/A')}")
+
+            print(f"🔍 DEBUG: Total sources: {results['total_sources']}, Verified: {results['verified_count']}")
+            return results
+
+        except Exception as e:
+            print(f"❌ Search error in search_all_sources: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            return results  # Return empty results jika error
+            
+import socket
+import time
+import random
+import re
+import threading
+import requests
+from collections import deque
+from datetime import datetime
+import sqlite3
+import os
+
+class DeepBot:
+    def __init__(self):
+        # ==================== IRC CONFIG ====================
+        self.server = "irc.kampungchat.org"
+        self.port = 6668
+        self.nick = "deep"
+        self.username = "seek"
+        self.nickserv_password = "ace:123456"
+        self.realname = "I'm your future, past and present, I'm the fine line 🧠"
+
+        # Channels list
+        self.channels = ['#amboi','#ace', '#zumba', '#alamanda', '#bro', '#desa', '#purple', "#amboi", "#movie", "#meow", "#love"]
+
+        # AI API Configuration (GROQ)
+        self.api_key = "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"
+        self.api_url = "https://api.groq.com/openai/v1/chat/completions"
+
+        # ==================== PRIVATE CHAT SYSTEM ====================
+        self.private_chat_enabled = True
+        self.invite_chance = 25
+        self.private_cooldown = 5
+        self.last_private_reply = 0
+        self.private_conversations = {}
+        self.last_invite_sent = {}
+        self.invite_cooldown = 300
+
+        # ==================== FOCUS SYSTEM ====================
+        self.user_focus = {}
+        self.focus_duration = 300
+        self.user_mentions = {}
+        self.mentions_threshold = 3
+
+        # ==================== PER-CHANNEL CONTEXT ====================
+        self.message_buffers = {}
+        self.last_buffer_process = {}
+
+        # ==================== BOT STATES ====================
+        self.silent_mode = False
+        self.silent_until = 0
+
+        # ==================== MESSAGE QUEUE SYSTEM ====================
+        self.message_queue = deque()
+        self.is_sending = False
+        self.last_send_time = 0
+        self.min_delay = 3
+        self.max_queue_size = 15
+
+        # ==================== AI COOLDOWN ====================
+        self.last_ai_time = 0
+        self.ai_cooldown = 3
+        self.channel_ai_cooldown = 2
+        self.channel_last_ai = {}
+        self.min_thinking_time = 3.0
+        self.focus_thinking_time = 2.0
+
+        # ==================== CHANNEL TRACKING ====================
+        self.channel_users = {}
+        self.channel_activity = {}
+
+        # ==================== SOCKET CONNECTION ====================
+        self.sock = None
+        self.running = True
+        self.connected = False
+
+        # ==================== MEMORY SYSTEM ====================
+        self.conversation_memory = []
+        self.max_messages = 30
+        self.cleanup_threshold = 10
+
+        # ==================== AUTO EXPIRY CONFIG ====================
+        self.memory_expiry_days = 30
+        self.last_cleanup_time = 0
+        self.cleanup_interval = 86400
+
+        print(f"🌐 Enhanced Language Detection: Malay + English + Mixed")
+        print(f"🧠 Memory system: max={self.max_messages}, auto-cleanup={self.cleanup_threshold}")
+        print(f"🗑️  Auto-expiry: {self.memory_expiry_days} hari, setiap {self.cleanup_interval//3600} jam")
+        print(f"✅ Private Chat: ENABLED ({self.invite_chance}% invite chance)")
+        print(f"✅ Focus System: ENABLED ({self.mentions_threshold} mentions)")
+        print(f"✅ AI Responses: ENABLED (Groq API)")
+        print(f"✅ Channels: {', '.join(self.channels)}")
+        print("="*60)
+        os.makedirs('logs', exist_ok=True)
+
+    # ==================== ENHANCED LANGUAGE DETECTION ====================
+    def detect_language_enhanced(self, text):
+        """Enhanced language detection dengan scoring system yang lebih baik"""
+        if not text or len(text.strip()) < 2:
+            return "mixed"
+
+        text_lower = text.lower().strip()
+
+        # Extended Malay patterns dengan weight
+        malay_patterns = {
+            # High weight indicators (3 points)
+            'high': {
+                'nak', 'tak', 'lah', 'pun', 'kan', 'nya', 'ke', 'tu', 'ni',
+                'awak', 'kamu', 'aku', 'saya', 'dia', 'mereka', 'kami', 'kita',
+                'apa', 'mana', 'kenapa', 'bagaimana', 'bila', 'berapa', 'mengapa',
+                'dah', 'sudah', 'belum', 'akan', 'boleh', 'mesti', 'harus',
+                'jom', 'mari', 'ayuh', 'weh', 'eh', 'hei', 'oi'
+            },
+            # Medium weight indicators (2 points)
+            'medium': {
+                'sangat', 'amat', 'sekali', 'sikit', 'banyak', 'sedikit',
+                'baik', 'bagus', 'teruk', 'cantik', 'hodoh', 'best', 'mantap',
+                'hari', 'malam', 'pagi', 'petang', 'esok', 'semalam', 'tadi',
+                'makan', 'minum', 'tidur', 'kerja', 'main', 'belajar', 'baca',
+                'rumah', 'kereta', 'motor', 'jalan', 'kedai', 'sekolah'
+            },
+            # Low weight indicators (1 point)
+            'low': {
+                'terima kasih', 'maaf', 'tolong', 'sila', 'harap', 'minta',
+                'seperti', 'macam', 'sama', 'lain', 'baru', 'lama', 'besar',
+                'kecil', 'tinggi', 'rendah', 'jauh', 'dekat', 'cepat', 'lambat'
+            }
+        }
+
+        # English patterns dengan weight
+        english_patterns = {
+            'high': {
+                'the', 'is', 'are', 'was', 'were', 'am', 'be', 'being',
+                'what', 'why', 'when', 'where', 'how', 'who', 'which',
+                'you', 'your', 'yours', 'me', 'my', 'mine', 'he', 'she', 'it',
+                'they', 'them', 'their', 'we', 'us', 'our', 'have', 'has', 'had'
+            },
+            'medium': {
+                'hello', 'hi', 'hey', 'good', 'bad', 'nice', 'great', 'awesome',
+                'thanks', 'thank', 'please', 'sorry', 'excuse', 'welcome',
+                'today', 'yesterday', 'tomorrow', 'now', 'then', 'here', 'there'
+            },
+            'low': {
+                'like', 'love', 'hate', 'want', 'need', 'think', 'know',
+                'see', 'look', 'hear', 'feel', 'make', 'take', 'give', 'get'
+            }
+        }
+
+        # Calculate weighted scores
+        malay_score = 0
+        english_score = 0
+
+        # Check Malay patterns
+        for weight_category, patterns in malay_patterns.items():
+            weight = {'high': 3, 'medium': 2, 'low': 1}[weight_category]
+            for pattern in patterns:
+                if pattern in text_lower:
+                    malay_score += weight
+
+        # Check English patterns
+        for weight_category, patterns in english_patterns.items():
+            weight = {'high': 3, 'medium': 2, 'low': 1}[weight_category]
+            for pattern in patterns:
+                if pattern in text_lower:
+                    english_score += weight
+
+        # Special rojak patterns (mix indicators)
+        rojak_indicators = ['la', 'lor', 'mah', 'leh', 'one', 'also can', 'can la']
+        rojak_score = sum(2 for indicator in rojak_indicators if indicator in text_lower)
+
+        print(f"🌐 Language scores - Malay: {malay_score}, English: {english_score}, Rojak: {rojak_score}")
+
+        # Decision logic
+        if rojak_score >= 2:
+            return "mixed"
+        elif malay_score >= 3 and malay_score > english_score:
+            return "malay"
+        elif english_score >= 3 and english_score > malay_score:
+            return "english"
+        elif malay_score > 0 and english_score > 0:
+            return "mixed"
+        elif malay_score > english_score:
+            return "malay"
+        elif english_score > malay_score:
+            return "english"
+        else:
+            return "mixed"
+
+    def detect_language(self, text):
+        """Main language detection dengan fallback"""
+        if not text or len(text.strip()) < 3:
+            return "mixed"
+
+        # Clean text first
+        clean_text = self.strip_irc_codes(text)
+
+        # Use enhanced detection
+        detected = self.detect_language_enhanced(clean_text)
+
+        print(f"🌐 Language detected: '{clean_text[:50]}...' -> {detected}")
+        return detected
+
+    # ==================== IRC CONNECTION ====================
+    def connect(self):
+        """Connect to IRC server"""
+        try:
+            print(f"🔗 Connecting to {self.server}:{self.port}...")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(300)
-            self.sock.connect((SERVER, PORT))
-            self.send_raw(f"NICK {NICK}")
-            self.send_raw(f"USER seek 0 * :I'm your future, past and present, I'm the fine line")
-            print("✅ Connected!")
-            return True
+            self.sock.settimeout(30)
+
+            # 👇 BAIKI SINI: Tukar } kepada )
+            self.sock.connect((self.server, self.port)) 
+
+            self.send_raw(f"NICK {self.nick}")
+            self.send_raw(f"USER {self.username} 0 * :{self.realname}")
+
+            # Tunggu server register nick
+            time.sleep(3)
+
+            # IDENTIFY ke NickServ
+            if self.nickserv_password:
+                print(f"🔐 Sending Identify command...")
+                # Format standard: Nick + Password
+                self.send_raw(f"PRIVMSG NickServ :IDENTIFY {self.nick} {self.nickserv_password}")
+                time.sleep(5) # Tunggu balasan dari server
+
+            # Join channel
+            print("🚀 Joining channels...")
+            for channel in self.channels:
+                self.send_raw(f"JOIN {channel}")
+                print(f"✅ Attempting to Join {channel}")
+                time.sleep(1)
+
+            self.connected = True
+            print("✅ Connection sequence sent!")
+
         except Exception as e:
             print(f"❌ Connection failed: {e}")
-            return False
+            time.sleep(15)
+            self.connect()
 
     def send_raw(self, message):
+        """Send raw IRC command"""
         try:
             self.sock.send(f"{message}\r\n".encode())
+            print(f"📤 RAW: {message}")
+            time.sleep(0.5)
         except Exception as e:
             print(f"❌ Send error: {e}")
 
-    def send_message(self, target, message):
-        if message and len(message) > 400:
-            message = message[:397] + "..."
-        self.send_raw(f"PRIVMSG {target} :{message}")
+    # ==================== MESSAGE CLEANING ====================
+    def strip_irc_codes(self, text):
+        """Strip IRC control codes dan formatting"""
+        if not text:
+            return text
 
-    def send_action(self, target, action):
-        self.send_raw(f"PRIVMSG {target} :\x01ACTION {action}\x01")
+        # Remove IRC color codes
+        irc_color_pattern = re.compile(r'[\x02\x03\x0F\x16\x1D\x1F](\d{1,2}(,\d{1,2})?)?')
+        text = irc_color_pattern.sub('', text)
 
-    def send_smart_response(self, channel, response):
-        """Smart response system - 1-2 lines maximum"""
-        response = response.replace('"', '').strip()
+        # Remove other control characters
+        control_chars_pattern = re.compile(r'[\x00-\x1F\x7F]')
+        text = control_chars_pattern.sub('', text)
 
-        if len(response) <= 120:
-            self.send_message(channel, response)
-            return
+        # Remove ACTION format markers
+        text = text.replace('\x01ACTION', '').replace('\x01', '')
 
-        words = response.split()
-        if len(words) <= 12:
-            self.send_message(channel, response)
-            return
+        # Clean up extra spaces
+        text = re.sub(r'\s+', ' ', text).strip()
 
-        mid_point = len(words) // 2
-        line1 = " ".join(words[:mid_point])
-        line2 = " ".join(words[mid_point:])
+        return text
 
-        self.send_message(channel, line1)
-        time.sleep(0.3)
-        self.send_message(channel, line2)
+    # ==================== AI ANALYSIS WITH FIXED LANGUAGE SUPPORT ====================
+    def ai_analyze_message(self, message, nick, channel, conversation_history, is_in_focus=False):
+        """AI analysis dengan language-aware prompts yang diperbaiki"""
+        start_time = time.time()
 
-    def join_channels(self):
-        for channel in CHANNELS:
-            self.send_raw(f"JOIN {channel}")
-            time.sleep(2)
-        print("✅ Joined all channels!")
+        print(f"🤖 AI PROCESS START: {nick} in {channel}")
 
-    def identify_nickserv(self):
-        if PASSWORD:
-            self.send_raw(f"PRIVMSG NickServ :IDENTIFY {PASSWORD}")
-            time.sleep(1)
-            print("✅ Identified with NickServ")
+        if len(message.strip()) < 3 or message.startswith('!'):
+            print(f"🎯 Skipping AI untuk message pendek/command")
+            return False, ""
 
-    def handle_nick_change(self, old_nick, new_nick):
-        """Better nick change handling"""
-        print(f"🎭 Nick change: {old_nick} → {new_nick}")
+        try:
+            # Detect language dengan enhanced method
+            detected_lang = self.detect_language(message)
+            print(f"🌐 Detected language: {detected_lang}")
 
-        self.bot.nick_history[new_nick] = old_nick
+            # Prepare context
+            current_context = "\n".join([f"{user}: {msg}" for user, msg in conversation_history[-6:]])
+            if not current_context:
+                current_context = "(New conversation started)"
 
-        action_response = self.bot.get_nickchange_response(f"{old_nick} to {new_nick}")
+            # Get SQLite history untuk context yang lebih kaya
+            sqlite_history = self._get_optimized_history_for_ai(channel, nick, days=7, max_messages=50)
 
-        for channel in CHANNELS:
-            self.send_action(channel, action_response)
-        print(f"✅ Nick change announced: {action_response}")
+            # ==================== FIXED LANGUAGE PROMPTS ====================
 
-    def handle_kick(self, channel, kicked_nick, kicker, reason):
-        """Handle kick - auto rejoin 30s"""
-        if kicked_nick == NICK:
-            print(f"🚨 Bot kicked from {channel} by {kicker}")
-            self.kicked_channels[channel] = time.time() + 30
-            print(f"🔄 Auto-rejoining {channel} in 30 seconds...")
+            # Malay prompt - diperbaiki
+            malay_prompt = f"""Anda ialah {self.nick} (panggil diri "aku"), bot IRC yang pandai bersembang dalam Bahasa Malaysia.
 
-    def check_auto_rejoin(self):
-        """Auto rejoin check"""
-        current_time = time.time()
-        channels_to_rejoin = []
+    **🎯 GAYA BAHASA MALAYSIA:**
+    - Gunakan Bahasa Malaysia yang natural dan santai
+    - Boleh campur sedikit English (rojak style Malaysia)
+    - Panggil diri "aku", user dengan nama mereka
+    - Guna kata-kata seperti: nak, tak, lah, pun, kan, weh, eh
+    - Jawapan pendek dan mesra dengan emoji 😊🎯🤗
+    - Jangan terlalu formal atau kaku
 
-        for channel, rejoin_time in self.kicked_channels.items():
-            if current_time >= rejoin_time:
-                channels_to_rejoin.append(channel)
+    **📜 SEJARAH PERCAKAPAN #{channel}:**
+    {sqlite_history[:800] if sqlite_history else "Tiada sejarah"}
 
-        for channel in channels_to_rejoin:
-            print(f"🔄 Rejoining {channel}...")
-            self.send_raw(f"JOIN {channel}")
-            del self.kicked_channels[channel]
-            time.sleep(2)
+    **💬 KONTEKS TERKINI:**
+    {current_context}
 
-    def handle_action_message(self, nick, channel, action_text):
-        """Handle /me action"""
-        result = self.bot.process_message(nick, action_text, channel)
+    **📝 MESEJ DARI {nick}:**
+    "{message}"
 
-        if result == "CONNECTING":
-            self.send_action(channel, "is connecting... ⚡")
-            time.sleep(1)
-            memory_context = self.bot.get_memory_context(nick)
-            ai_response = self.bot.get_greeting_response(action_text, memory_context)
-            self.bot.update_memory(nick, action_text, ai_response)
-            self.send_smart_response(channel, ai_response)
-            self.bot.current_processing = None
-            self.bot.current_processing_user = None
+    Jawab dalam format:
+    <DECISION>YA atau TIDAK</DECISION>
+    <RESPONSE>jawapan dalam BM</RESPONSE>"""
 
-        elif result and "|" in result:
-            action_type, data = result.split("|", 1)
+            # English prompt - diperbaiki  
+            english_prompt = f"""You are {self.nick} ("aku" mean me or I'm), an IRC bot who chats naturally in English.
 
-            if action_type == "SEARCH":
-                self.send_action(channel, "is searching... 🔍")
-                time.sleep(1)
-                search_data = self.bot.google_search(action_text)
-                self.bot.last_search_data[nick] = search_data
-                self.send_action(channel, "is analyzing data... 📊")
-                time.sleep(1)
-                ai_response = self.bot.ai_analyze(action_text, search_data, data)
-                self.bot.update_memory(nick, action_text, ai_response)
-                self.send_smart_response(channel, ai_response)
-                self.bot.current_processing = None
-                self.bot.current_processing_user = None
+    **🎯 ENGLISH CHAT STYLE:**
+    - Natural, casual English conversation
+    - Can mix some Malay words (Malaysian rojak style)
+    - "aku" mean me or I'm, users by their names
+    - Short, friendly responses with revelan emojis 😊👍🎯
+    - Don't be too formal or robotic
 
-            elif action_type == "NEXT":
-                self.send_action(channel, "getting more info... 📡")
-                time.sleep(1)
-                self.send_smart_response(channel, data)
-                self.bot.update_memory(nick, action_text, data)
-                self.bot.current_processing = None
-                self.bot.current_processing_user = None
+    **📜 CONVERSATION HISTORY #{channel}:**
+    {sqlite_history[:800] if sqlite_history else "No history"}
 
-            elif action_type == "CHAT":
-                if self.bot.should_use_action_response():
-                    action_response = self.bot.get_action_response(action_text, data)
-                    self.send_action(channel, action_response)
-                    self.bot.update_memory(nick, action_text, f"ACTION: {action_response}")
-                    time.sleep(0.5)
-                    follow_up_response = self.bot.get_chat_response(action_text, data)
-                    self.bot.update_memory(nick, action_text, follow_up_response)
-                    self.send_smart_response(channel, follow_up_response)
-                else:
-                    self.send_action(channel, "is thinking... 🤔")
-                    time.sleep(1)
-                    response = self.bot.get_chat_response(action_text, data)
-                    self.bot.update_memory(nick, action_text, response)
-                    self.send_smart_response(channel, response)
-                self.bot.current_processing = None
-                self.bot.current_processing_user = None
+    **💬 CURRENT CONTEXT:**
+    {current_context}
 
-        elif result:
-            self.bot.update_memory(nick, action_text, result)
-            self.send_smart_response(channel, result)
-            self.bot.current_processing = None
-            self.bot.current_processing_user = None
+    **📝 MESSAGE FROM {nick}:**
+    "{message}"
 
-    def handle_normal_message(self, nick, channel, message):
-        """Handle normal message dengan proper action follow-up"""
-        current_time = time.time()
+    Respond in format:
+    <DECISION>YES or NO</DECISION>
+    <RESPONSE>response in English</RESPONSE>"""
 
-        print(f"📨 Received from {nick} in {channel}: {message}")
+            # Mixed/Rojak prompt - diperbaiki
+            mixed_prompt = f"""You are {self.nick} (call yourself "aku"), an IRC bot who speaks Malaysian rojak (mix Malay-English).
 
-        if self.bot.current_processing:
-            print(f"⏩ Skipping {nick} - bot currently processing")
-            return
+    **🎯 ROJAK STYLE:**
+    - Natural mix of Malay and English (Malaysian style)
+    - Use words like: can la, like that lor, nak, tak, also, one
+    - Call yourself "aku", users by their names  
+    - Casual and friendly with emojis 😊🎯
+    - Short responses, don't be formal
 
-        self.bot.current_processing_user = nick
+    **📜 CONVERSATION HISTORY #{channel}:**
+    {sqlite_history[:800] if sqlite_history else "No history"}
 
-        is_bot_mentioned = self.bot.is_mention(message)
-        is_in_focus = self.bot.is_in_focus(nick)
+    **💬 CURRENT CONTEXT:**
+    {current_context}
 
-        print(f"🔍 {nick} - Mentioned: {is_bot_mentioned}, In Focus: {is_in_focus}")
+    **📝 MESSAGE FROM {nick}:**
+    "{message}"
 
-        if is_bot_mentioned:
-            print(f"🎯 {nick} mentioned bot, activating focus")
-            self.bot.activate_focus(nick)
+    Respond in format:
+    <DECISION>YES or NO</DECISION>
+    <RESPONSE>rojak style response</RESPONSE>"""
 
-        result = self.bot.process_message(nick, message, channel)
+            # Select appropriate prompt
+            prompts = {
+                'malay': malay_prompt,
+                'english': english_prompt,
+                'mixed': mixed_prompt
+            }
 
-        if result == "CONNECTING":
-            if not self.bot.is_in_focus(nick):
-                self.send_action(channel, "is connecting... ⚡")
-                time.sleep(1)
-            memory_context = self.bot.get_memory_context(nick)
-            ai_response = self.bot.get_greeting_response(message, memory_context)
-            self.bot.update_memory(nick, message, ai_response)
-            self.send_smart_response(channel, ai_response)
-            self.bot.current_processing = None
-            self.bot.current_processing_user = None
+            system_prompt = prompts.get(detected_lang, mixed_prompt)
 
-        elif result and "|" in result:
-            action_type, data = result.split("|", 1)
+            print(f"🧠 Using {detected_lang.upper()} prompt")
 
-            if action_type == "SEARCH":
-                self.send_action(channel, "is searching... 🔍")
-                time.sleep(1)
-                search_data = self.bot.google_search(message)
-                self.bot.last_search_data[nick] = search_data
-                self.send_action(channel, "is analyzing data... 📊")
-                time.sleep(1)
-                ai_response = self.bot.ai_analyze(message, search_data, data)
-                self.bot.update_memory(nick, message, ai_response)
-                self.send_smart_response(channel, ai_response)
-                self.bot.current_processing = None
-                self.bot.current_processing_user = None
+            # ==================== 🎯 RETRY MECHANISM 3x ====================
+            max_retries = 3
 
-            elif action_type == "NEXT":
-                self.send_action(channel, "getting more info... 📡")
-                time.sleep(1)
-                self.send_smart_response(channel, data)
-                self.bot.update_memory(nick, message, data)
-                self.bot.current_processing = None
-                self.bot.current_processing_user = None
+            for attempt in range(max_retries):
+                try:
+                    print(f"🔄 AI Attempt {attempt + 1}/{max_retries}")
 
-            elif action_type == "CHAT":
-                if self.bot.should_use_action_response():
-                    action_response = self.bot.get_action_response(message, data)
-                    self.send_action(channel, action_response)
-                    self.bot.update_memory(nick, message, f"ACTION: {action_response}")
-                    time.sleep(0.5)
-                    follow_up_response = self.bot.get_chat_response(message, data)
-                    self.bot.update_memory(nick, message, follow_up_response)
-                    self.send_smart_response(channel, follow_up_response)
-                else:
-                    self.send_action(channel, "is thinking... 🤔")
-                    time.sleep(1)
-                    response = self.bot.get_chat_response(message, data)
-                    self.bot.update_memory(nick, message, response)
-                    self.send_smart_response(channel, response)
-                self.bot.current_processing = None
-                self.bot.current_processing_user = None
+                    # API call
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"{nick} in #{channel}: {message[:150]}"}
+                    ]
 
-        elif result:
-            self.bot.update_memory(nick, message, result)
-            self.send_smart_response(channel, result)
-            self.bot.current_processing = None
-            self.bot.current_processing_user = None
+                    payload = {
+                        "model": "llama-3.1-8b-instant",
+                        "messages": messages,
+                        "max_tokens": 150,
+                        "temperature": 0.8,
+                        "top_p": 0.9
+                    }
 
-        elif self.bot.is_in_focus(nick) and not self.bot.current_processing:
-            memory_context = self.bot.get_memory_context(nick)
+                    headers = {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    }
 
-            action = self.bot.should_search(message)
+                    api_start = time.time()
+                    response = requests.post(
+                        self.api_url,
+                        headers=headers,
+                        json=payload,
+                        timeout=15
+                    )
+                    api_time = time.time() - api_start
 
-            if action == "SEARCH":
-                self.send_action(channel, "is searching... 🔍")
-                time.sleep(1)
-                search_data = self.bot.google_search(message)
-                self.bot.last_search_data[nick] = search_data
-                self.send_action(channel, "is analyzing data... 📊")
-                time.sleep(1)
-                ai_response = self.bot.ai_analyze(message, search_data, memory_context)
-                self.bot.update_memory(nick, message, ai_response)
-                self.send_smart_response(channel, ai_response)
+                    if response.status_code == 200:
+                        ai_text = response.json()['choices'][0]['message']['content'].strip()
 
+                        total_time = time.time() - start_time
+
+                        # Enforce minimum thinking time
+                        if total_time < self.min_thinking_time:
+                            extra_wait = self.min_thinking_time - total_time
+                            print(f"⏳ Waiting {extra_wait:.1f}s more...")
+                            time.sleep(extra_wait)
+
+                        print(f"🧠 AI Response (attempt {attempt+1}): '{ai_text[:200]}...'")
+
+                        # Parse response dengan language awareness
+                        decision, bot_response = self.parse_ai_response_fixed(ai_text, detected_lang)
+
+                        # 🎯 🎯 🎯 **MODIFY DI SINI: LOGIC BARU** 🎯 🎯 🎯
+                        # Jika ada response yang cukup panjang, kita HANTAR walaupun decision TIDAK/NO
+                        if bot_response and len(bot_response.strip()) >= 10:  # Minimum 10 chars
+                            print(f"✅ AI ada response yang cukup panjang ({len(bot_response)} chars)")
+
+                            # Auto-add emoji jika sesuai
+                            if not any(emoji in bot_response for emoji in ['😊', '😅', '😂', '👍', '🎯', '🤗']):
+                                bot_response += " 😊"
+
+                            print(f"🎯 Will RESPOND dengan response (decision was: {decision})")
+                            return True, bot_response
+                        elif decision in ["YA", "YES"] and bot_response and len(bot_response.strip()) > 3:
+                            # Original logic untuk YA/YES dengan response
+                            print(f"🎯 AI decided to RESPOND in {channel}")
+                            return True, bot_response
+                        else:
+                            print(f"⚠️ Attempt {attempt+1}: No valid response (decision: {decision}, length: {len(bot_response) if bot_response else 0})")
+
+                            # Jika bukan attempt terakhir, retry
+                            if attempt < max_retries - 1:
+                                print(f"🔄 Retrying in 0.5s...")
+                                time.sleep(0.5)
+                                continue
+                            else:
+                                print(f"🎯 AI decided to SKIP in {channel} (all attempts failed)")
+                                return False, ""
+
+                    else:
+                        print(f"❌ AI API Error {response.status_code} on attempt {attempt+1}")
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5)
+                            continue
+
+                except Exception as e:
+                    print(f"❌ AI Error on attempt {attempt+1}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+                        continue
+
+            print(f"❌ All {max_retries} attempts failed")
+            return False, ""
+
+        except Exception as e:
+            print(f"❌ AI Process Error: {e}")
+            return False, ""
+
+    def parse_ai_response_fixed(self, ai_text, language):
+        """Fixed parser untuk AI response dengan better language handling"""
+        if not ai_text:
+            return "NO", ""
+
+        ai_text = ai_text.strip()
+        print(f"🔧 PARSING [{language}]: '{ai_text[:100]}...'")
+
+        # Language-specific decision words
+        if language == 'malay':
+            yes_words = ['YA', 'SETUJU', 'BOLEH']
+            no_words = ['TIDAK', 'TAK', 'TAKNAK']
+            default_yes = 'YA'
+            default_no = 'TIDAK'
+        else:  # english or mixed
+            yes_words = ['YES', 'YA', 'OK', 'SURE']
+            no_words = ['NO', 'TIDAK', 'NAH', 'NOPE']
+            default_yes = 'YES'
+            default_no = 'NO'
+
+        decision = default_no
+        bot_response = ""
+
+        # ==================== 🎯 PATTERN 1: XML FORMAT ====================
+        decision_match = re.search(r'<DECISION>\s*([^<]+?)\s*</DECISION>', ai_text, re.IGNORECASE)
+        response_match = re.search(r'<RESPONSE>\s*(.*?)\s*</RESPONSE>', ai_text, re.DOTALL | re.IGNORECASE)
+
+        if decision_match:
+            decision_text = decision_match.group(1).strip().upper()
+
+            if any(yes_word in decision_text for yes_word in yes_words):
+                decision = default_yes
             else:
-                if self.bot.should_use_action_response():
-                    action_response = self.bot.get_action_response(message, memory_context)
-                    self.send_action(channel, action_response)
-                    self.bot.update_memory(nick, message, f"ACTION: {action_response}")
-                    time.sleep(0.5)
-                    chat_response = self.bot.get_chat_response(message, memory_context)
-                    self.bot.update_memory(nick, message, chat_response)
-                    self.send_smart_response(channel, chat_response)
+                decision = default_no
+
+            print(f"🔧 Found XML decision: {decision_text} -> {decision}")
+
+        if response_match:
+            bot_response = response_match.group(1).strip()
+            print(f"🔧 Found XML response: '{bot_response[:50]}...'")
+
+        # ==================== 🎯 PATTERN 2: MARKDOWN BOLD FORMAT ====================
+        # Contoh: **DECISION:YES** atau **DECISION: NO** atau **RESPONSE:**
+        if not decision_match:
+            # Cari **DECISION:YES** atau **DECISION: NO**
+            md_decision_match = re.search(r'\*\*DECISION\s*:\s*([^\*]+)\*\*', ai_text, re.IGNORECASE)
+
+            if md_decision_match:
+                decision_text = md_decision_match.group(1).strip().upper()
+
+                if any(yes_word in decision_text for yes_word in yes_words):
+                    decision = default_yes
                 else:
-                    self.send_action(channel, "is thinking... 🤔")
-                    time.sleep(1)
-                    response = self.bot.get_chat_response(message, memory_context)
-                    self.bot.update_memory(nick, message, response)
-                    self.send_smart_response(channel, response)
+                    decision = default_no
 
-        self.bot.current_processing = None
-        self.bot.current_processing_user = None
+                print(f"🔧 Found Markdown decision: '{decision_text}' -> {decision}")
 
-    def run(self):
-        while True:
-            if self.connect():
-                time.sleep(3)
-                self.identify_nickserv()
-                self.join_channels()
-                print("🤖 GENIUS AI BOT STARTED!")
-                print("🎭 Nick Change Detection: ACTIVE")
-                print("📝 Smart Response: ENABLED (1-2 lines)")
-                print("🔧 Static Response System: ACTIVE")
-                print("🔄 Action Follow-up: ENABLED")
-                print("🧠 Smart Conversation Detection: ACTIVE")
-                print("🎯 Advanced Nick Detection: ACTIVE")
-                print("🔤 Google Translate System: ACTIVE")
+        if not response_match:
+            # Cari **RESPONSE:** text
+            md_response_match = re.search(r'\*\*RESPONSE\s*:\s*\*\*(.*?)(?:\*\*|$)', ai_text, re.DOTALL | re.IGNORECASE)
 
-                buffer = ""
-                while True:
-                    try:
-                        self.check_auto_rejoin()
+            if md_response_match:
+                bot_response = md_response_match.group(1).strip()
+                print(f"🔧 Found Markdown response: '{bot_response[:50]}...'")
+            else:
+                # Pattern alternatif: **RESPONSE:** diikuti text (tanpa closing **)
+                if '**RESPONSE:**' in ai_text.upper() or '**RESPONSE:**' in ai_text:
+                    start_idx = ai_text.upper().find('**RESPONSE:**')
+                    if start_idx != -1:
+                        start_idx += len('**RESPONSE:**')
+                        bot_response = ai_text[start_idx:].strip()
+                        print(f"🔧 Found **RESPONSE:** without closing: '{bot_response[:50]}...'")
 
-                        data = self.sock.recv(1024).decode('utf-8', errors='ignore')
-                        if not data:
-                            break
+        # ==================== 🎯 PATTERN 3: SIMPLE TEXT FORMAT ====================
+        # Contoh: DECISION: YES (tanpa **)
+        if not decision_match and not md_decision_match:
+            simple_decision_match = re.search(r'DECISION\s*:\s*([^\n]+)', ai_text, re.IGNORECASE)
 
-                        buffer += data
-                        lines = buffer.split('\r\n')
-                        buffer = lines.pop()
+            if simple_decision_match:
+                decision_text = simple_decision_match.group(1).strip().upper()
 
-                        for line in lines:
-                            line = line.strip()
-                            if not line:
-                                continue
+                if any(yes_word in decision_text for yes_word in yes_words):
+                    decision = default_yes
+                else:
+                    decision = default_no
 
-                            if line.startswith(':'):
-                                parts = line.split()
+                print(f"🔧 Found simple text decision: '{decision_text}' -> {decision}")
 
-                                if len(parts) >= 3 and parts[1] == 'NICK':
-                                    old_nick = parts[0][1:].split('!')[0]
-                                    new_nick = parts[2][1:] if parts[2].startswith(':') else parts[2]
+        if not response_match and not md_response_match:
+            simple_response_match = re.search(r'RESPONSE\s*:\s*(.*?)(?:\n\n|\n<|$)', ai_text, re.DOTALL | re.IGNORECASE)
 
-                                    if old_nick != NICK:
-                                        self.handle_nick_change(old_nick, new_nick)
-                                    continue
+            if simple_response_match:
+                bot_response = simple_response_match.group(1).strip()
+                print(f"🔧 Found simple text response: '{bot_response[:50]}...'")
 
-                            if 'PRIVMSG' in line:
-                                try:
-                                    parts = line.split(' ', 3)
-                                    if len(parts) >= 4:
-                                        nick = parts[0][1:].split('!')[0]
-                                        channel = parts[2]
-                                        message = parts[3][1:]
+        # ==================== 🎯 FALLBACK: Extract dari text selepas decision ====================
+        if not bot_response:
+            # Try to extract response after decision line
+            if decision_match:
+                remaining_text = ai_text[decision_match.end():].strip()
+                # Remove any remaining XML tags
+                remaining_text = re.sub(r'<[^>]*>', '', remaining_text).strip()
+                if remaining_text:
+                    bot_response = remaining_text
+            elif md_decision_match:
+                # Untuk markdown format
+                remaining_text = ai_text[md_decision_match.end():].strip()
+                if remaining_text:
+                    bot_response = remaining_text
 
-                                        if message.startswith('\x01ACTION ') and message.endswith('\x01'):
-                                            action_text = message[8:-1]
-                                            self.handle_action_message(nick, channel, action_text)
-                                        else:
-                                            self.handle_normal_message(nick, channel, message)
+        # ==================== 🎯 ULTIMATE FALLBACK: Ambil semua content ====================
+        if not bot_response:
+            # Split into lines
+            lines = [line.strip() for line in ai_text.split('\n') if line.strip()]
 
-                                except Exception as e:
-                                    print(f"Error: {e}")
+            content_lines = []
+            skip_next = False
 
-                            if line.startswith('PING'):
-                                self.send_raw(f"PONG :{line.split(':')[1]}")
-                                continue
+            for line in lines:
+                line_upper = line.upper()
 
-                    except Exception as e:
-                        print(f"❌ Error: {e}")
+                # Skip decision/response lines
+                if (line_upper.startswith('<DECISION>') or 
+                    line_upper.startswith('</DECISION>') or
+                    line_upper.startswith('<RESPONSE>') or 
+                    line_upper.startswith('</RESPONSE>') or
+                    'DECISION:' in line_upper or
+                    'RESPONSE:' in line_upper or
+                    line_upper in yes_words + no_words):
+
+                    # Jika line ada **DECISION:** atau **RESPONSE:**, skip line tu
+                    if '**DECISION:**' in line_upper or '**RESPONSE:**' in line_upper:
+                        continue
+                    skip_next = True
+                    continue
+
+                if skip_next:
+                    skip_next = False
+                    continue
+
+                if line and len(line.strip()) > 2:
+                    content_lines.append(line)
+
+            if content_lines:
+                bot_response = ' '.join(content_lines).strip()
+                print(f"🔧 Fallback content: '{bot_response[:50]}...'")
+
+        # ==================== 🎯 CLEAN RESPONSE ====================
+        if bot_response:
+            # 🎯 **FIX: Remove markdown formatting FIRST**
+            # Remove **bold** 
+            bot_response = re.sub(r'\*\*(.*?)\*\*', r'\1', bot_response)
+            # Remove *italic*
+            bot_response = re.sub(r'\*(?!\s)(.*?)\*', r'\1', bot_response)
+            # Remove _underscore_
+            bot_response = re.sub(r'_(.*?)_', r'\1', bot_response)
+
+            # 🎯 **Remove decision/response labels yang mungkin masih ada**
+            prefixes_to_remove = [
+                'DECISION:', 'RESPONSE:', 'JAWAPAN:', 'BALAS:', 'ANSWER:',
+                ':', '-', '•', '>'
+            ]
+
+            for prefix in prefixes_to_remove:
+                # Check case insensitive
+                if bot_response.upper().startswith(prefix.upper()):
+                    bot_response = bot_response[len(prefix):].strip()
+
+            # Remove remaining XML tags
+            bot_response = re.sub(r'<[^>]*>', '', bot_response).strip()
+
+            # 🎯 **Remove any stray markdown chars**
+            bot_response = bot_response.replace('**', '').replace('*', '')
+
+            # Clean punctuation
+            bot_response = bot_response.strip(' .,;:!?*#-')
+
+            # Ensure proper capitalization
+            if bot_response and bot_response[0].islower():
+                bot_response = bot_response[0].upper() + bot_response[1:]
+
+        # Final validation
+        if decision == default_yes and (not bot_response or len(bot_response.strip()) < 3):
+            # If decision is yes but no valid response, change to no
+            decision = default_no
+            bot_response = ""
+
+        print(f"🔧 FINAL PARSE: decision={decision}, response='{bot_response[:80] if bot_response else 'NONE'}...'")
+
+        return decision, bot_response
+
+    # ==================== HELPER METHODS ====================
+    def _get_optimized_history_for_ai(self, channel, nick, days=7, max_messages=50):
+        """Get optimized history for AI context"""
+        try:
+            conn = sqlite3.connect('logs/chat_logs.sqlite', timeout=10)
+            cursor = conn.cursor()
+
+            # Create table if not exists
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick TEXT NOT NULL,
+                message TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                time_str TEXT NOT NULL,
+                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+
+            cutoff_time = time.time() - (days * 24 * 3600)
+
+            cursor.execute('''
+                SELECT nick, message, timestamp 
+                FROM chat_logs 
+                WHERE channel = ? AND timestamp >= ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', (channel, cutoff_time, max_messages))
+
+            messages = cursor.fetchall()
+            conn.close()
+
+            if not messages:
+                return f"📭 No recent history in {channel}"
+
+            # Format messages
+            history_lines = []
+            for msg in sorted(messages, key=lambda x: x[2])[-30:]:  # Last 30 messages
+                msg_nick, msg_text, msg_time = msg
+
+                if len(msg_text.strip()) < 3 or self._is_bot_message(msg_nick, msg_text):
+                    continue
+
+                time_str = datetime.fromtimestamp(msg_time).strftime('%H:%M')
+                truncated = msg_text[:100] + "..." if len(msg_text) > 100 else msg_text
+                history_lines.append(f"[{time_str}] {msg_nick}: {truncated}")
+
+            return "\n".join(history_lines[-20:])  # Return last 20 formatted messages
+
+        except Exception as e:
+            print(f"❌ History error: {e}")
+            return ""
+
+    def _is_bot_message(self, nick, text):
+        """Check if message is from a bot"""
+        bot_indicators = ['KCFM', 'RADIO', 'BOT', 'SERV', 'LoveFM', 'LepakFM', 'ZumbaQuiz']
+        return any(indicator in nick.upper() for indicator in bot_indicators)
+
+    # ==================== MESSAGE PROCESSING ====================
+    def process_message(self, nick, message, channel):
+        """Process incoming messages"""
+        print(f"\n📩 {nick} in {channel}: {message}")
+
+        self.current_processing_channel = channel
+        current_time = time.time()
+
+        # Add to buffer and memory
+        self.add_to_message_buffer(nick, message, channel, current_time)
+        self.add_to_memory(nick, message, channel)
+
+        # Check silent mode
+        self.check_silent_mode()
+
+        # Handle special commands
+        if self.handle_special_commands(message, nick, channel):
+            return
+
+        if self.silent_mode:
+            print(f"🔇 Silent mode active")
+            return
+
+        # Track mentions
+        self.track_mention(nick, message, channel)
+
+        # Process buffer
+        window_messages = self.process_buffer_if_ready(channel)
+
+        if window_messages:
+            if current_time - self.last_ai_time < self.ai_cooldown:
+                print(f"⏳ AI cooldown active")
+                return
+
+            # Process messages
+            for msg in window_messages:
+                if msg['nick'] == nick:  # Process current user's message
+                    should_respond = (
+                        self.nick.lower() in msg['message'].lower() or
+                        self.is_user_in_focus(nick)
+                    )
+
+                    if should_respond:
+                        self.last_ai_time = current_time
+
+                        conversation_history = self.get_filtered_conversation_history(channel)
+                        is_in_focus = self.is_user_in_focus(nick)
+
+                        should_respond, ai_response = self.ai_analyze_message(
+                            msg['message'], nick, channel, conversation_history, is_in_focus
+                        )
+
+                        if should_respond and ai_response:
+                            print(f"🎯 Sending AI response to {nick}")
+                            self.send_message(channel, ai_response)
                         break
 
-            print("🔄 Reconnecting in 10 seconds...")
-            time.sleep(10)
+    # ==================== SUPPORTING METHODS ====================
+    def add_to_message_buffer(self, nick, message, channel, timestamp):
+        """Add message to buffer"""
+        if channel not in self.message_buffers:
+            self.message_buffers[channel] = []
+            self.last_buffer_process[channel] = 0
 
+        self.message_buffers[channel].append({
+            'nick': nick,
+            'message': message,
+            'channel': channel,
+            'timestamp': timestamp,
+            'processed': False
+        })
+
+        # Clean old messages
+        current_time = time.time()
+        self.message_buffers[channel] = [
+            msg for msg in self.message_buffers[channel]
+            if current_time - msg['timestamp'] < 5
+        ]
+
+    def process_buffer_if_ready(self, channel):
+        """Process buffer if ready"""
+        if channel not in self.message_buffers:
+            return None
+
+        current_time = time.time()
+
+        if (not self.message_buffers[channel] or 
+            current_time - self.last_buffer_process.get(channel, 0) < 1):
+            return None
+
+        unprocessed = [msg for msg in self.message_buffers[channel] if not msg['processed']]
+
+        if unprocessed:
+            oldest = min(unprocessed, key=lambda x: x['timestamp'])
+            window_start = oldest['timestamp']
+
+            window_messages = [
+                msg for msg in self.message_buffers[channel]
+                if msg['timestamp'] - window_start <= 3 and not msg['processed']
+            ]
+
+            if window_messages:
+                for msg in window_messages:
+                    msg['processed'] = True
+
+                self.last_buffer_process[channel] = current_time
+                return window_messages
+
+        return None
+
+    def add_to_memory(self, nick, message, channel):
+        """Add message to memory with auto-cleanup"""
+        if nick.lower() == self.nick.lower():
+            return
+
+        clean_message = self.strip_irc_codes(message)
+
+        if not clean_message or len(clean_message.strip()) < 2:
+            return
+
+        memory_entry = {
+            'nick': nick,
+            'message': clean_message,
+            'channel': channel,
+            'timestamp': time.time(),
+            'time_str': time.strftime('%I:%M%p', time.localtime()).lower(),
+            'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+        # Initialize memory if needed
+        if not hasattr(self, 'conversation_memory'):
+            self.conversation_memory = []
+
+        # Check if memory is full
+        if len(self.conversation_memory) >= self.max_messages:
+            # Archive old messages
+            messages_to_archive = self.conversation_memory[:self.cleanup_threshold]
+            self.save_to_sqlite(messages_to_archive)
+            self.conversation_memory = self.conversation_memory[self.cleanup_threshold:]
+
+        self.conversation_memory.append(memory_entry)
+        self.log_message_to_sqlite(memory_entry)
+
+    def save_to_sqlite(self, messages):
+        """Save messages to SQLite"""
+        try:
+            if not messages:
+                return
+
+            os.makedirs('logs', exist_ok=True)
+            conn = sqlite3.connect('logs/chat_logs.sqlite')
+            cursor = conn.cursor()
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick TEXT NOT NULL,
+                message TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                time_str TEXT NOT NULL,
+                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+
+            for msg in messages:
+                cursor.execute('''
+                INSERT INTO chat_logs (nick, message, channel, timestamp, time_str)
+                VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    msg['nick'], msg['message'], msg['channel'],
+                    msg['timestamp'], msg.get('time_str', '')
+                ))
+
+            conn.commit()
+            conn.close()
+            print(f"💾 Saved {len(messages)} messages to SQLite")
+
+        except Exception as e:
+            print(f"❌ Error saving to SQLite: {e}")
+
+    def log_message_to_sqlite(self, message):
+        """Log message to SQLite in real-time"""
+        try:
+            os.makedirs('logs', exist_ok=True)
+            conn = sqlite3.connect('logs/chat_logs.sqlite')
+            cursor = conn.cursor()
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick TEXT NOT NULL,
+                message TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                time_str TEXT NOT NULL,
+                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+
+            cursor.execute('''
+            INSERT INTO chat_logs (nick, message, channel, timestamp, time_str)
+            VALUES (?, ?, ?, ?, ?)
+            ''', (
+                message['nick'], message['message'], message['channel'],
+                message['timestamp'], message.get('time_str', '')
+            ))
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print(f"❌ Error logging to SQLite: {e}")
+
+    def cleanup_old_messages(self):
+        """Auto cleanup old messages"""
+        try:
+            current_time = time.time()
+
+            if current_time - self.last_cleanup_time < self.cleanup_interval:
+                return
+
+            print(f"🧹 Starting auto-cleanup...")
+
+            os.makedirs('logs', exist_ok=True)
+            conn = sqlite3.connect('logs/chat_logs.sqlite')
+            cursor = conn.cursor()
+
+            expiry_timestamp = current_time - (self.memory_expiry_days * 86400)
+
+            cursor.execute('DELETE FROM chat_logs WHERE timestamp < ?', (expiry_timestamp,))
+            deleted_count = cursor.rowcount
+
+            cursor.execute('VACUUM')
+            conn.commit()
+            conn.close()
+
+            self.last_cleanup_time = current_time
+            print(f"🧹 Cleanup completed: {deleted_count} messages deleted")
+
+        except Exception as e:
+            print(f"❌ Cleanup error: {e}")
+
+    # ==================== FOCUS AND MENTION SYSTEM ====================
+    def track_mention(self, user, message, channel):
+        """Track mentions for focus system"""
+        if self.nick.lower() in message.lower():
+            current_time = time.time()
+
+            if user not in self.user_mentions:
+                self.user_mentions[user] = {'total_count': 0, 'last_mention_time': current_time}
+
+            self.user_mentions[user]['total_count'] += 1
+            self.user_mentions[user]['last_mention_time'] = current_time
+
+            if self.user_mentions[user]['total_count'] >= self.mentions_threshold:
+                self.update_user_focus(user, channel)
+                self.user_mentions[user]['total_count'] = 0
+
+    def update_user_focus(self, user, channel):
+        """Update user focus"""
+        if self.is_user_in_focus(user):
+            return
+
+        current_time = time.time()
+        self.user_focus[user] = current_time + self.focus_duration
+
+        focus_message = f"auto reply activated buat {user} tanpa mention {self.nick} lagi. Taip '.clear' untuk bersihkan."
+        self.send_message(channel, focus_message)
+
+    def is_user_in_focus(self, user):
+        """Check if user is in focus"""
+        current_time = time.time()
+
+        if user in self.user_focus:
+            if current_time < self.user_focus[user]:
+                return True
+            else:
+                del self.user_focus[user]
+
+        return False
+
+    def get_filtered_conversation_history(self, channel):
+        """Get filtered conversation history for channel"""
+        filtered_history = []
+
+        for msg in self.conversation_memory[-20:]:
+            if (msg['channel'] == channel and 
+                not msg['message'].startswith('ACTION') and
+                len(msg['message'].strip()) > 3 and
+                not self._is_bot_message(msg['nick'], msg['message'])):
+                filtered_history.append((msg['nick'], msg['message']))
+
+        return filtered_history[-8:]
+
+    # ==================== SPECIAL COMMANDS ====================
+    def handle_special_commands(self, message, nick, channel):
+        """Handle special bot commands"""
+        message_lower = message.lower()
+        bot_nick_lower = self.nick.lower()
+
+        # Silent command
+        if any(cmd in message_lower for cmd in ['diam', 'shut up', 'senyap']) and bot_nick_lower in message_lower:
+            self.silent_mode = True
+            self.silent_until = time.time() + 300
+            self.send_action(channel, f"goes silent after {nick}'s command 🤐")
+            return True
+
+        # Speak command  
+        if any(cmd in message_lower for cmd in ['speak', 'cakap', 'reply']) and bot_nick_lower in message_lower:
+            self.silent_mode = False
+            self.silent_until = 0
+            self.send_action(channel, f"starts talking again after {nick}'s request 🔊")
+            return True
+
+        # Clear focus
+        if message.lower().strip() == '.clear':
+            if nick in self.user_focus:
+                del self.user_focus[nick]
+                self.send_message(channel, f"Focus cleared untuk {nick}")
+                return True
+
+        return False
+
+    def check_silent_mode(self):
+        """Check if silent mode should be disabled"""
+        if self.silent_mode and time.time() > self.silent_until:
+            self.silent_mode = False
+
+    # ==================== MESSAGE SENDING ====================
+    def send_message(self, target, message):
+        """Send message with proper formatting"""
+        formatted_messages = self.format_long_message(message)
+
+        if len(formatted_messages) > 4:
+            formatted_messages = formatted_messages[:4]
+
+        for formatted_msg in formatted_messages:
+            self.queue_message(target, formatted_msg, priority=1)
+
+    def send_action(self, target, action_text):
+        """Send ACTION message"""
+        action_message = f"\x01ACTION {action_text}\x01"
+        self.queue_message(target, action_message, priority=1)
+
+    def format_long_message(self, message):
+        """Format long messages"""
+        if len(message) <= 170:
+            return [message]
+
+        sentences = re.split(r'(?<=[.!?])\s+', message)
+
+        if not sentences:
+            return [message[:170] + "..."]
+
+        lines = []
+        current_line = ""
+
+        for sentence in sentences:
+            if len(current_line) + len(sentence) + 1 <= 170:
+                current_line += " " + sentence if current_line else sentence
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = sentence
+
+            if len(lines) >= 4:
+                if current_line:
+                    lines.append(current_line[:170] + "...")
+                break
+
+        if current_line and len(lines) < 4:
+            lines.append(current_line)
+
+        return lines
+
+    def queue_message(self, target, message, priority=1):
+        """Queue message for sending"""
+        if len(self.message_queue) >= self.max_queue_size:
+            self.message_queue.popleft()
+
+        self.message_queue.append((target, message, priority, time.time()))
+        self.process_queue()
+
+    def process_queue(self):
+        """Process message queue"""
+        if not self.message_queue or self.is_sending:
+            return
+
+        self.is_sending = True
+
+        try:
+            while self.message_queue:
+                current_time = time.time()
+                time_since_last = current_time - self.last_send_time
+
+                if time_since_last < self.min_delay:
+                    time.sleep(self.min_delay - time_since_last)
+
+                target, message, priority, queue_time = self.message_queue.popleft()
+
+                if current_time - queue_time > 30:
+                    continue
+
+                self.send_raw(f"PRIVMSG {target} :{message}")
+                self.last_send_time = current_time
+
+                if self.message_queue:
+                    time.sleep(random.uniform(1.0, 2.0))
+
+        except Exception as e:
+            print(f"❌ Queue error: {e}")
+        finally:
+            self.is_sending = False
+
+    # ==================== PRIVATE CHAT SYSTEM ====================
+    def handle_private_message(self, nick, message):
+        """Handle private messages"""
+        current_time = time.time()
+
+        if current_time - self.last_private_reply < self.private_cooldown:
+            return
+
+        self.last_private_reply = current_time
+
+        # Track conversation
+        if nick not in self.private_conversations:
+            self.private_conversations[nick] = []
+
+        self.private_conversations[nick].append({
+            'time': current_time,
+            'sender': nick,
+            'message': message,
+            'type': 'user'
+        })
+
+        # Get AI response
+        ai_response = self.get_ai_private_response(nick, message)
+
+        if ai_response:
+            response = ai_response
+        else:
+            fallbacks = [
+                f"Hai {nick}! 😊",
+                f"Hello {nick}! 👍",
+                f"Hey {nick}! 🎯"
+            ]
+            response = random.choice(fallbacks)
+
+        self.send_private_message(nick, response)
+
+    def get_ai_private_response(self, nick, message):
+        """Get AI response for private message"""
+        if not self.api_key:
+            return None
+
+        try:
+            detected_lang = self.detect_language(message)
+
+            if detected_lang == 'malay':
+                system_prompt = f"Anda ialah {self.nick}, bot IRC yang mesra. Jawab dalam Bahasa Malaysia yang santai dengan emoji."
+            else:
+                system_prompt = f"You are {self.nick}, a friendly IRC bot. Respond in casual English with emojis."
+
+            payload = {
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"{nick}: {message}"}
+                ],
+                "max_tokens": 80,
+                "temperature": 0.8
+            }
+
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(self.api_url, headers=headers, json=payload, timeout=10)
+
+            if response.status_code == 200:
+                return response.json()['choices'][0]['message']['content'].strip()
+
+        except Exception as e:
+            print(f"❌ Private AI error: {e}")
+
+        return None
+
+    def send_private_message(self, nick, message):
+        """Send private message"""
+        self.send_raw(f"PRIVMSG {nick} :{message}")
+
+    # ==================== MAIN LOOP ====================
+    def run(self):
+        """Main bot loop"""
+        print("🚀 Starting DeepBot with Enhanced Language Support...")
+
+        self.connect()
+        buffer = ""
+        self.last_cleanup_time = time.time()
+
+        while self.running:
+            try:
+                self.sock.settimeout(1.0)
+
+                # Auto cleanup check
+                current_time = time.time()
+                if current_time - self.last_cleanup_time >= self.cleanup_interval:
+                    self.cleanup_old_messages()
+
+                try:
+                    data = self.sock.recv(2048).decode('utf-8', errors='ignore')
+                except socket.timeout:
+                    if self.message_queue:
+                        self.process_queue()
+                    continue
+
+                if not data:
+                    print("❌ Connection lost")
+                    time.sleep(10)
+                    self.connect()
+                    continue
+
+                buffer += data
+                lines = buffer.split("\r\n")
+                buffer = lines.pop()
+
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Handle PING
+                    if line.startswith("PING"):
+                        ping_data = line.split(":")[1] if ":" in line else ""
+                        self.send_raw(f"PONG :{ping_data}")
+                        continue
+
+                    # Parse PRIVMSG
+                    if "PRIVMSG" in line:
+                        try:
+                            sender_part = line.split(' ')[0]
+                            sender = sender_part[1:].split('!')[0]
+
+                            if sender.lower() == self.nick.lower():
+                                continue
+
+                            parts = line.split(' ', 3)
+                            if len(parts) >= 4:
+                                target = parts[2]
+                                message = parts[3][1:] if parts[3].startswith(':') else parts[3]
+
+                                # Private message
+                                if target.lower() == self.nick.lower():
+                                    if self.private_chat_enabled:
+                                        threading.Thread(
+                                            target=self.handle_private_message,
+                                            args=(sender, message),
+                                            daemon=True
+                                        ).start()
+
+                                # Channel message
+                                elif target.startswith('#'):
+                                    target_lower = target.lower()
+                                    matched_channel = None
+
+                                    for channel in self.channels:
+                                        if channel.lower() == target_lower:
+                                            matched_channel = channel
+                                            break
+
+                                    if matched_channel and sender != self.nick:
+                                        threading.Thread(
+                                            target=self.process_message,
+                                            args=(sender, message, matched_channel),
+                                            daemon=True
+                                        ).start()
+
+                        except Exception as e:
+                            print(f"❌ PRIVMSG parse error: {e}")
+
+                    # Handle numeric replies
+                    elif line.startswith(':'):
+                        parts = line.split()
+                        if len(parts) > 1 and parts[1].isdigit():
+                            code = parts[1]
+
+                            if code in ['001', '376', '422']:
+                                self.connected = True
+
+                            elif code == '433':
+                                self.nick = f"{self.nick}_"
+                                self.send_raw(f"NICK {self.nick}")
+
+                            elif code == '353':  # User list
+                                if len(parts) >= 5:
+                                    channel_from_server = parts[4]
+                                    users_msg = ' '.join(parts[5:])[1:] if len(parts) > 5 else ""
+                                    users = users_msg.split()
+
+                                    matched_channel = None
+                                    for channel in self.channels:
+                                        if channel.lower() == channel_from_server.lower():
+                                            matched_channel = channel
+                                            break
+
+                                    if matched_channel:
+                                        if matched_channel not in self.channel_users:
+                                            self.channel_users[matched_channel] = set()
+
+                                        for user in users:
+                                            clean_user = user.lstrip('@+%&~')
+                                            self.channel_users[matched_channel].add(clean_user)
+
+                # Process queue
+                if self.message_queue:
+                    self.process_queue()
+
+            except socket.error as e:
+                print(f"❌ Socket error: {e}")
+                time.sleep(15)
+                self.connect()
+
+            except Exception as e:
+                print(f"❌ Main loop error: {e}")
+                time.sleep(30)
+                if not self.connected:
+                    self.connect()
+
+# ==================== MAIN EXECUTION ====================
 if __name__ == "__main__":
-    client = IRCClient()
-    client.run()
+    print("="*60)
+    print("🤖 Deep v4.2 - LANGUAGE DETECTION FIXED")
+    print("🌐 Enhanced Malay + English + Mixed Language Support")
+    print("🔧 Fixed AI Response Parsing")
+    print("💾 Auto-expiry Log System")
+    print("="*60)
+
+    bot = DeepBot()
+
+    try:
+        bot.run()
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user")
+    except Exception as e:
+        print(f"\n❌ Bot crashed: {e}")
+        import traceback
+        traceback.print_exc()
