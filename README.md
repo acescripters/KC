@@ -37,9 +37,9 @@ Configuration
 Edit config.py with your settings:
 
 python
-SERVER = "irc.rizon.net"
-PORT = 6667
-CHANNELS = ["#ace", "#bot-test"]
+SERVER = "irc.kampungchat.org"
+PORT = 6668
+CHANNELS = ["#ace", "#amboi"]
 # Add your API keys in api.py
 Running the Bot
 bash
