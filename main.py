@@ -17,8 +17,8 @@ from datetime import datetime
 
 # ==================== KONFIGURASI ====================
 BOT_FILES = {
-    "WWW": "bot_www.py",
-    "MINAH": "minahstabil.py", 
+    "WWW": "www.py",
+    "MINAH": "minah.py", 
     "DEEP": "deep.py"
 }
 
