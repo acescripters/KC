@@ -125,14 +125,29 @@ class VerifiedSearchEngine:
                 weather_main = data['weather'][0]['main'].lower()
                 weather_desc = data['weather'][0]['description']
                 
-                # Detect rain
-                is_raining = weather_main in ['rain', 'drizzle', 'thunderstorm']
-                rain_status = "🌧️ HUJAN" if is_raining else "☀️ TIDAK HUJAN"
-                
                 # Get rain volume if available
                 rain_volume = ""
-                if 'rain' in data and '1h' in data['rain']:
-                    rain_volume = f" ({data['rain']['1h']}mm/h)"
+                rain_amount = 0
+                if 'rain' in data:
+                    if '1h' in data['rain']:
+                        rain_amount = data['rain']['1h']
+                        rain_volume = f" ({rain_amount}mm/h)"
+                    elif '3h' in data['rain']:
+                        rain_amount = data['rain']['3h'] / 3
+                        rain_volume = f" ({rain_amount:.1f}mm/h)"
+                
+                # Detect rain - check both weather type AND rain volume
+                is_raining = (weather_main in ['rain', 'drizzle', 'thunderstorm']) or (rain_amount > 0)
+                
+                # More specific rain status
+                if rain_amount > 5:
+                    rain_status = "🌧️ HUJAN LEBAT"
+                elif rain_amount > 0.5:
+                    rain_status = "🌦️ HUJAN"
+                elif rain_amount > 0:
+                    rain_status = "🌦️ HUJAN RINTIK"
+                else:
+                    rain_status = "☀️ TIDAK HUJAN"
                 
                 # Cloud coverage
                 clouds = data['clouds']['all']
