@@ -318,6 +318,9 @@ class DeepBot:
 
         # ==================== AUTO EXPIRY CONFIG ====================
         self.memory_expiry_days = 30
+
+        # ==================== SEARCH ENGINE ====================
+        self.search_engine = VerifiedSearchEngine()
         self.last_cleanup_time = 0
         self.cleanup_interval = 86400
 
@@ -1263,6 +1266,18 @@ class DeepBot:
         message_lower = message.lower()
         bot_nick_lower = self.nick.lower()
 
+        # !ask command - Search web
+        if message.startswith('!ask '):
+            query = message[5:].strip()
+            if query:
+                self.send_action(channel, f"searching for '{query}'... 🔍")
+                threading.Thread(
+                    target=self.handle_ask_command,
+                    args=(query, nick, channel),
+                    daemon=True
+                ).start()
+                return True
+
         # Silent command
         if any(cmd in message_lower for cmd in ['diam', 'shut up', 'senyap']) and bot_nick_lower in message_lower:
             self.silent_mode = True
@@ -1285,6 +1300,37 @@ class DeepBot:
                 return True
 
         return False
+
+    def handle_ask_command(self, query, nick, channel):
+        """Handle !ask command - search web using VerifiedSearchEngine"""
+        try:
+            # Try Wikipedia Malay first
+            result = self.search_engine.search_wikipedia(query, lang='ms')
+            
+            if result and result != "Tiada hasil ditemui.":
+                self.send_message(channel, f"{nick}: {result}")
+                return
+            
+            # Try Wikipedia English
+            result = self.search_engine.search_wikipedia(query, lang='en')
+            
+            if result and result != "No results found.":
+                self.send_message(channel, f"{nick}: {result}")
+                return
+            
+            # Try news search
+            result = self.search_engine.search_news(query)
+            
+            if result and "Error" not in result:
+                self.send_message(channel, f"{nick}: {result}")
+                return
+            
+            # No results found
+            self.send_message(channel, f"{nick}: Maaf, tiada hasil ditemui untuk '{query}'. Cuba topik lain.")
+            
+        except Exception as e:
+            print(f"❌ Error in !ask command: {e}")
+            self.send_message(channel, f"{nick}: Maaf, ada masalah semasa mencari. Cuba lagi.")
 
     def check_silent_mode(self):
         """Check if silent mode should be disabled"""
