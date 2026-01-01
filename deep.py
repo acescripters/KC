@@ -5,6 +5,7 @@ import random
 import requests
 import datetime as dt
 from collections import deque
+import html
 
 # ===== VERIFIED SEARCH ENGINE =====
 class VerifiedSearchEngine:
@@ -1312,12 +1313,32 @@ class DeepBot:
     def handle_ask_command(self, query, nick, channel):
         """Handle !ask command - search web using VerifiedSearchEngine"""
         try:
+            # Check for weather queries
+            weather_keywords = ['weather', 'cuaca', 'suhu', 'temperature', 'hujan', 'rain']
+            is_weather_query = any(keyword in query.lower() for keyword in weather_keywords)
+            
+            if is_weather_query:
+                # Try to get weather data
+                weather_data = self.search_engine.get_weather(query)
+                if weather_data:
+                    response = f"🌤️ {weather_data['location']}: {weather_data['temp']}°C, {weather_data['description']}, Humidity: {weather_data['humidity']}%"
+                    self.send_message(channel, f"{nick}: {response}")
+                    return
+            
             # Try Wikipedia Malay first
             results = self.search_engine.search_wikipedia(query, lang='ms')
             
             if results and len(results) > 0:
                 top_result = results[0]
-                response = f"📚 {top_result['title']}: {top_result['snippet'][:200]}... | {top_result['url']}"
+                # Decode HTML entities and clean snippet
+                snippet = html.unescape(top_result['snippet'])
+                snippet = re.sub(r'\s+', ' ', snippet).strip()
+                
+                # Limit to 150 chars for cleaner output
+                if len(snippet) > 150:
+                    snippet = snippet[:150] + "..."
+                
+                response = f"📚 {top_result['title']}: {snippet} → {top_result['url']}"
                 self.send_message(channel, f"{nick}: {response}")
                 return
             
@@ -1326,7 +1347,15 @@ class DeepBot:
             
             if results and len(results) > 0:
                 top_result = results[0]
-                response = f"📚 {top_result['title']}: {top_result['snippet'][:200]}... | {top_result['url']}"
+                # Decode HTML entities and clean snippet
+                snippet = html.unescape(top_result['snippet'])
+                snippet = re.sub(r'\s+', ' ', snippet).strip()
+                
+                # Limit to 150 chars
+                if len(snippet) > 150:
+                    snippet = snippet[:150] + "..."
+                
+                response = f"📚 {top_result['title']}: {snippet} → {top_result['url']}"
                 self.send_message(channel, f"{nick}: {response}")
                 return
             
@@ -1335,7 +1364,8 @@ class DeepBot:
             
             if news_results and len(news_results) > 0:
                 top_news = news_results[0]
-                response = f"📰 {top_news.get('title', 'News')}: {top_news.get('description', '')[:150]}..."
+                description = top_news.get('description', '')[:120]
+                response = f"📰 {top_news.get('title', 'News')}: {description}..."
                 self.send_message(channel, f"{nick}: {response}")
                 return
             
