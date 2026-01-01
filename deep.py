@@ -62,7 +62,11 @@ class VerifiedSearchEngine:
                 'utf8': 1
             }
 
-            response = requests.get(source['url'], params=params, timeout=10)
+            headers = {
+                'User-Agent': 'DeepBot/1.0 (IRC Bot; Educational Purpose)'
+            }
+
+            response = requests.get(source['url'], params=params, headers=headers, timeout=10)
 
             if response.status_code == 200:
                 data = response.json()
@@ -1305,24 +1309,30 @@ class DeepBot:
         """Handle !ask command - search web using VerifiedSearchEngine"""
         try:
             # Try Wikipedia Malay first
-            result = self.search_engine.search_wikipedia(query, lang='ms')
+            results = self.search_engine.search_wikipedia(query, lang='ms')
             
-            if result and result != "Tiada hasil ditemui.":
-                self.send_message(channel, f"{nick}: {result}")
+            if results and len(results) > 0:
+                top_result = results[0]
+                response = f"📚 {top_result['title']}: {top_result['snippet'][:200]}... | {top_result['url']}"
+                self.send_message(channel, f"{nick}: {response}")
                 return
             
             # Try Wikipedia English
-            result = self.search_engine.search_wikipedia(query, lang='en')
+            results = self.search_engine.search_wikipedia(query, lang='en')
             
-            if result and result != "No results found.":
-                self.send_message(channel, f"{nick}: {result}")
+            if results and len(results) > 0:
+                top_result = results[0]
+                response = f"📚 {top_result['title']}: {top_result['snippet'][:200]}... | {top_result['url']}"
+                self.send_message(channel, f"{nick}: {response}")
                 return
             
             # Try news search
-            result = self.search_engine.search_news(query)
+            news_results = self.search_engine.search_news(query)
             
-            if result and "Error" not in result:
-                self.send_message(channel, f"{nick}: {result}")
+            if news_results and len(news_results) > 0:
+                top_news = news_results[0]
+                response = f"📰 {top_news.get('title', 'News')}: {top_news.get('description', '')[:150]}..."
+                self.send_message(channel, f"{nick}: {response}")
                 return
             
             # No results found
@@ -1330,6 +1340,8 @@ class DeepBot:
             
         except Exception as e:
             print(f"❌ Error in !ask command: {e}")
+            import traceback
+            traceback.print_exc()
             self.send_message(channel, f"{nick}: Maaf, ada masalah semasa mencari. Cuba lagi.")
 
     def check_silent_mode(self):
