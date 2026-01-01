@@ -621,8 +621,12 @@ class MinahBot:
             bot_response = re.sub(r'_(.*?)_', r'\1', bot_response)
 
             # 🎯 **Remove decision/response labels yang mungkin masih ada**
+            # Remove patterns like "YES RESPONSE:", "NO RESPONSE:", etc
+            bot_response = re.sub(r'^(YES|NO|YA|TIDAK)\s+(RESPONSE|DECISION)\s*:\s*', '', bot_response, flags=re.IGNORECASE).strip()
+            
             prefixes_to_remove = [
                 'DECISION:', 'RESPONSE:', 'JAWAPAN:', 'BALAS:', 'ANSWER:',
+                'YES:', 'NO:', 'YA:', 'TIDAK:',
                 ':', '-', '•', '>'
             ]
 
