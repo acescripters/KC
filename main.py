@@ -22,7 +22,7 @@ BOT_FILES = {
     "DEEP": "deep.py"
 }
 
-HEALTH_PORT = 8080
+HEALTH_PORT = int(os.environ.get('PORT', 8080))  # Support Render dynamic port
 CHECK_INTERVAL = 5  # Saat antara check bot
 ANTI_SLEEP_INTERVAL = 240  # 4 minit - ping sendiri
 
