@@ -121,6 +121,9 @@ class VerifiedSearchEngine:
             if response.status_code == 200:
                 data = response.json()
                 
+                # Debug: Print full weather data
+                print(f"🔍 Weather API Response: {data}")
+                
                 # Get weather condition
                 weather_main = data['weather'][0]['main'].lower()
                 weather_desc = data['weather'][0]['description']
@@ -128,13 +131,18 @@ class VerifiedSearchEngine:
                 # Get rain volume if available
                 rain_volume = ""
                 rain_amount = 0
+                
+                # Check for rain data
                 if 'rain' in data:
+                    print(f"🔍 Rain data found: {data['rain']}")
                     if '1h' in data['rain']:
                         rain_amount = data['rain']['1h']
                         rain_volume = f" ({rain_amount}mm/h)"
                     elif '3h' in data['rain']:
                         rain_amount = data['rain']['3h'] / 3
                         rain_volume = f" ({rain_amount:.1f}mm/h)"
+                else:
+                    print(f"🔍 No rain data in response")
                 
                 # Detect rain - check both weather type AND rain volume
                 is_raining = (weather_main in ['rain', 'drizzle', 'thunderstorm']) or (rain_amount > 0)
@@ -145,6 +153,8 @@ class VerifiedSearchEngine:
                 elif rain_amount > 0.5:
                     rain_status = "🌦️ HUJAN"
                 elif rain_amount > 0:
+                    rain_status = "🌦️ HUJAN RINTIK"
+                elif weather_main in ['rain', 'drizzle']:
                     rain_status = "🌦️ HUJAN RINTIK"
                 else:
                     rain_status = "☀️ TIDAK HUJAN"
@@ -375,6 +385,9 @@ class DeepBot:
 
         # ==================== SEARCH ENGINE ====================
         self.search_engine = VerifiedSearchEngine()
+        
+        # ==================== PAGINATION STORAGE ====================
+        self.paginated_results = {}  # Store results per user: {nick: {'results': [], 'current': 0}}
         self.last_cleanup_time = 0
         self.cleanup_interval = 86400
 
@@ -1324,6 +1337,25 @@ class DeepBot:
         message_lower = message.lower()
         bot_nick_lower = self.nick.lower()
 
+        # !next command - Show next page of results
+        if message.strip() == '!next':
+            if nick in self.paginated_results:
+                data = self.paginated_results[nick]
+                data['current'] += 1
+                
+                if data['current'] < len(data['results']):
+                    self.send_message(channel, f"{nick}: {data['results'][data['current']]}")
+                    
+                    # Show !next hint if more pages available
+                    if data['current'] < len(data['results']) - 1:
+                        self.send_message(channel, f"(Taip !next untuk sambung)")
+                else:
+                    self.send_message(channel, f"{nick}: Tiada lagi hasil. Taip !ask <topik> untuk carian baru.")
+                    del self.paginated_results[nick]
+            else:
+                self.send_message(channel, f"{nick}: Tiada hasil untuk disambung. Taip !ask <topik> untuk carian baru.")
+            return True
+
         # !ask command - Search web
         if message.startswith('!ask '):
             query = message[5:].strip()
@@ -1384,12 +1416,46 @@ class DeepBot:
                 snippet = html.unescape(top_result['snippet'])
                 snippet = re.sub(r'\s+', ' ', snippet).strip()
                 
-                # Limit to 150 chars for cleaner output
-                if len(snippet) > 150:
-                    snippet = snippet[:150] + "..."
+                # Split into multiple lines if too long (max 200 chars per line)
+                lines = []
+                title_line = f"📚 {top_result['title']}: "
                 
-                response = f"📚 {top_result['title']}: {snippet} → {top_result['url']}"
-                self.send_message(channel, f"{nick}: {response}")
+                # Split snippet into chunks
+                max_line_length = 200
+                words = snippet.split()
+                current_line = title_line
+                
+                for word in words:
+                    if len(current_line) + len(word) + 1 <= max_line_length:
+                        current_line += word + " "
+                    else:
+                        lines.append(current_line.strip())
+                        current_line = word + " "
+                
+                if current_line.strip():
+                    lines.append(current_line.strip())
+                
+                # Add URL to last line
+                if lines:
+                    lines[-1] += f" → {top_result['url']}"
+                
+                # Limit to 4 lines
+                if len(lines) > 4:
+                    lines = lines[:4]
+                    lines[-1] += "..."
+                
+                # Store for pagination if more than 1 line
+                if len(lines) > 1:
+                    self.paginated_results[nick] = {
+                        'results': lines,
+                        'current': 0
+                    }
+                    # Send first line
+                    self.send_message(channel, f"{nick}: {lines[0]}")
+                    self.send_message(channel, f"(Taip !next untuk sambung)")
+                else:
+                    self.send_message(channel, f"{nick}: {lines[0]}")
+                
                 return
             
             # Try Wikipedia English
@@ -1401,12 +1467,44 @@ class DeepBot:
                 snippet = html.unescape(top_result['snippet'])
                 snippet = re.sub(r'\s+', ' ', snippet).strip()
                 
-                # Limit to 150 chars
-                if len(snippet) > 150:
-                    snippet = snippet[:150] + "..."
+                # Split into multiple lines if too long
+                lines = []
+                title_line = f"📚 {top_result['title']}: "
                 
-                response = f"📚 {top_result['title']}: {snippet} → {top_result['url']}"
-                self.send_message(channel, f"{nick}: {response}")
+                max_line_length = 200
+                words = snippet.split()
+                current_line = title_line
+                
+                for word in words:
+                    if len(current_line) + len(word) + 1 <= max_line_length:
+                        current_line += word + " "
+                    else:
+                        lines.append(current_line.strip())
+                        current_line = word + " "
+                
+                if current_line.strip():
+                    lines.append(current_line.strip())
+                
+                # Add URL to last line
+                if lines:
+                    lines[-1] += f" → {top_result['url']}"
+                
+                # Limit to 4 lines
+                if len(lines) > 4:
+                    lines = lines[:4]
+                    lines[-1] += "..."
+                
+                # Store for pagination
+                if len(lines) > 1:
+                    self.paginated_results[nick] = {
+                        'results': lines,
+                        'current': 0
+                    }
+                    self.send_message(channel, f"{nick}: {lines[0]}")
+                    self.send_message(channel, f"(Taip !next untuk sambung)")
+                else:
+                    self.send_message(channel, f"{nick}: {lines[0]}")
+                
                 return
             
             # Try news search
