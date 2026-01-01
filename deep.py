@@ -92,38 +92,72 @@ class VerifiedSearchEngine:
         return []
 
     def get_weather(self, location):
-        """🌤️ Get weather data from verified source"""
+        """🌤️ Get weather data from verified source with rain detection"""
         try:
-            # Untuk Malaysia/Indonesia, kita boleh guna OpenWeatherMap atau BMKG
+            # Extract location name
+            city = 'Kuala Lumpur'
             if 'kuala lumpur' in location.lower() or 'kl' in location.lower():
-                # Contoh untuk Kuala Lumpur
-                params = {
-                    'q': 'Kuala Lumpur, MY',
-                    'appid': self.sources['weather_gov']['api_key'],
-                    'units': 'metric',
-                    'lang': 'ms'
+                city = 'Kuala Lumpur'
+            elif 'penang' in location.lower():
+                city = 'Penang'
+            elif 'johor' in location.lower():
+                city = 'Johor Bahru'
+            elif 'ipoh' in location.lower():
+                city = 'Ipoh'
+            
+            params = {
+                'q': f'{city}, MY',
+                'appid': self.sources['weather_gov']['api_key'],
+                'units': 'metric',
+                'lang': 'en'
+            }
+
+            response = requests.get(
+                self.sources['weather_gov']['url'], 
+                params=params, 
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Get weather condition
+                weather_main = data['weather'][0]['main'].lower()
+                weather_desc = data['weather'][0]['description']
+                
+                # Detect rain
+                is_raining = weather_main in ['rain', 'drizzle', 'thunderstorm']
+                rain_status = "🌧️ HUJAN" if is_raining else "☀️ TIDAK HUJAN"
+                
+                # Get rain volume if available
+                rain_volume = ""
+                if 'rain' in data and '1h' in data['rain']:
+                    rain_volume = f" ({data['rain']['1h']}mm/h)"
+                
+                # Cloud coverage
+                clouds = data['clouds']['all']
+                cloud_status = "mendung" if clouds > 70 else "berawan" if clouds > 30 else "cerah"
+                
+                return {
+                    'location': data['name'],
+                    'temp': data['main']['temp'],
+                    'humidity': data['main']['humidity'],
+                    'description': weather_desc,
+                    'rain_status': rain_status,
+                    'rain_volume': rain_volume,
+                    'is_raining': is_raining,
+                    'clouds': clouds,
+                    'cloud_status': cloud_status,
+                    'weather_main': weather_main,
+                    'source': self.sources['weather_gov']['name'],
+                    'timestamp': dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'verified': True
                 }
-
-                response = requests.get(
-                    self.sources['weather_gov']['url'], 
-                    params=params, 
-                    timeout=10
-                )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    return {
-                        'location': data['name'],
-                        'temp': data['main']['temp'],
-                        'humidity': data['main']['humidity'],
-                        'description': data['weather'][0]['description'],
-                        'source': self.sources['weather_gov']['name'],
-                        'timestamp': dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'verified': True
-                    }
 
         except Exception as e:
             print(f"❌ Weather API error: {e}")
+            import traceback
+            traceback.print_exc()
 
         return None
 
@@ -1321,7 +1355,8 @@ class DeepBot:
                 # Try to get weather data
                 weather_data = self.search_engine.get_weather(query)
                 if weather_data:
-                    response = f"🌤️ {weather_data['location']}: {weather_data['temp']}°C, {weather_data['description']}, Humidity: {weather_data['humidity']}%"
+                    # Clear rain status response
+                    response = f"{weather_data['rain_status']} | {weather_data['location']}: {weather_data['temp']}°C, {weather_data['cloud_status']}{weather_data['rain_volume']}"
                     self.send_message(channel, f"{nick}: {response}")
                     return
             
