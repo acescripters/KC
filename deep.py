@@ -1391,8 +1391,43 @@ class DeepBot:
 
         return False
 
+    def summarize_with_ai(self, title, content, query):
+        """Use AI to summarize search results"""
+        try:
+            prompt = f"""Ringkaskan maklumat ini dalam 2-3 ayat yang mudah difahami dalam Bahasa Malaysia:
+
+Topik: {title}
+Soalan: {query}
+Maklumat: {content[:500]}
+
+Berikan jawapan ringkas dan padat yang menjawab soalan. Jangan copy paste, buat summary sendiri."""
+
+            payload = {
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 200
+            }
+
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(self.api_url, json=payload, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                summary = data['choices'][0]['message']['content'].strip()
+                return summary
+            
+        except Exception as e:
+            print(f"❌ AI summarize error: {e}")
+        
+        return None
+
     def handle_ask_command(self, query, nick, channel):
-        """Handle !ask command - search web using VerifiedSearchEngine"""
+        """Handle !ask command - search web using VerifiedSearchEngine with AI summary"""
         try:
             # Check for weather queries
             weather_keywords = ['weather', 'cuaca', 'suhu', 'temperature', 'hujan', 'rain']
@@ -1416,45 +1451,18 @@ class DeepBot:
                 snippet = html.unescape(top_result['snippet'])
                 snippet = re.sub(r'\s+', ' ', snippet).strip()
                 
-                # Split into multiple lines if too long (max 200 chars per line)
-                lines = []
-                title_line = f"📚 {top_result['title']}: "
+                # Use AI to summarize
+                ai_summary = self.summarize_with_ai(top_result['title'], snippet, query)
                 
-                # Split snippet into chunks
-                max_line_length = 200
-                words = snippet.split()
-                current_line = title_line
-                
-                for word in words:
-                    if len(current_line) + len(word) + 1 <= max_line_length:
-                        current_line += word + " "
-                    else:
-                        lines.append(current_line.strip())
-                        current_line = word + " "
-                
-                if current_line.strip():
-                    lines.append(current_line.strip())
-                
-                # Add URL to last line
-                if lines:
-                    lines[-1] += f" → {top_result['url']}"
-                
-                # Limit to 4 lines
-                if len(lines) > 4:
-                    lines = lines[:4]
-                    lines[-1] += "..."
-                
-                # Store for pagination if more than 1 line
-                if len(lines) > 1:
-                    self.paginated_results[nick] = {
-                        'results': lines,
-                        'current': 0
-                    }
-                    # Send first line
-                    self.send_message(channel, f"{nick}: {lines[0]}")
-                    self.send_message(channel, f"(Taip !next untuk sambung)")
+                if ai_summary:
+                    # Send AI summary + reference
+                    response = f"📚 {top_result['title']}: {ai_summary} | Ref: {top_result['url']}"
+                    self.send_message(channel, f"{nick}: {response}")
                 else:
-                    self.send_message(channel, f"{nick}: {lines[0]}")
+                    # Fallback to snippet if AI fails
+                    short_snippet = snippet[:150] + "..." if len(snippet) > 150 else snippet
+                    response = f"📚 {top_result['title']}: {short_snippet} → {top_result['url']}"
+                    self.send_message(channel, f"{nick}: {response}")
                 
                 return
             
@@ -1467,43 +1475,17 @@ class DeepBot:
                 snippet = html.unescape(top_result['snippet'])
                 snippet = re.sub(r'\s+', ' ', snippet).strip()
                 
-                # Split into multiple lines if too long
-                lines = []
-                title_line = f"📚 {top_result['title']}: "
+                # Use AI to summarize
+                ai_summary = self.summarize_with_ai(top_result['title'], snippet, query)
                 
-                max_line_length = 200
-                words = snippet.split()
-                current_line = title_line
-                
-                for word in words:
-                    if len(current_line) + len(word) + 1 <= max_line_length:
-                        current_line += word + " "
-                    else:
-                        lines.append(current_line.strip())
-                        current_line = word + " "
-                
-                if current_line.strip():
-                    lines.append(current_line.strip())
-                
-                # Add URL to last line
-                if lines:
-                    lines[-1] += f" → {top_result['url']}"
-                
-                # Limit to 4 lines
-                if len(lines) > 4:
-                    lines = lines[:4]
-                    lines[-1] += "..."
-                
-                # Store for pagination
-                if len(lines) > 1:
-                    self.paginated_results[nick] = {
-                        'results': lines,
-                        'current': 0
-                    }
-                    self.send_message(channel, f"{nick}: {lines[0]}")
-                    self.send_message(channel, f"(Taip !next untuk sambung)")
+                if ai_summary:
+                    response = f"📚 {top_result['title']}: {ai_summary} | Ref: {top_result['url']}"
+                    self.send_message(channel, f"{nick}: {response}")
                 else:
-                    self.send_message(channel, f"{nick}: {lines[0]}")
+                    # Fallback
+                    short_snippet = snippet[:150] + "..." if len(snippet) > 150 else snippet
+                    response = f"📚 {top_result['title']}: {short_snippet} → {top_result['url']}"
+                    self.send_message(channel, f"{nick}: {response}")
                 
                 return
             
