@@ -1,0 +1,2523 @@
+"""
+KAMPUNGCHAT IRC - FIXED VERSION
+Fix masalah: WHOIS, Prefix users, Channel history, PM/DM, Radio URL
+"""
+
+import socket
+import time
+import threading
+import random
+import json
+import re
+from datetime import datetime
+from flask import Flask, render_template_string, request, jsonify
+from flask_socketio import SocketIO, emit
+
+# ============================================================================
+# PART 1: IRC CLIENT (FIXED)
+# ============================================================================
+
+class IRCClient:
+    def __init__(self, nick_base="webuser", ident="webuser", 
+                 fullname="KampungChat Web User"):
+        self.server_name = "irc.kampungchat.org"
+        self.current_server = ""
+        self.port = 6668
+
+        self.ident = ident
+        self.fullname = fullname
+        self.nick = f"{nick_base}_{random.randint(10, 99):02d}"
+
+        # Connection
+        self.sock = None
+        self.connected = False
+        self.registered = False
+        self.running = False
+        self.registration_timeout = 30
+
+        # Channel tracking
+        self.channels = {}  # {channel: {nicks: [], messages: [], topic: ''}}
+        self.nicklist_buffer = {}
+        self.user_host_cache = {}
+        self.private_messages = {}  # {nick: [{sender, message, time, is_self}]}
+        self.current_channel = None  # Channel yang sedang aktif di view
+
+        # Auto-join queue
+        self.auto_join_channels = []
+        self.join_retry_count = {}
+        self.max_join_retries = 3
+
+        # Pending requests
+        self.pending_names = {}
+        self.whois_data = {}  # Store WHOIS responses
+
+        # WebSocket callback
+        self.web_callback = None
+
+    def set_web_callback(self, callback):
+        self.web_callback = callback
+
+    def emit_to_web(self, event_type, payload):
+        if self.web_callback:
+            self.web_callback(event_type, payload)
+
+    def connect(self):
+      """Connect ke IRC server dengan auto-retry nickname"""
+      print(f"[IRC] Connecting to {self.server_name}:{self.port}...")
+
+      try:
+          self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          self.sock.settimeout(30)
+          self.sock.connect((self.server_name, self.port))
+          self.connected = True
+
+          # Start receive thread
+          self.running = True
+          self.receive_thread = threading.Thread(target=self._receive_loop)
+          self.receive_thread.daemon = True
+          self.receive_thread.start()
+
+          # Registration dengan retry nickname
+          time.sleep(1)
+
+          # Generate nickname pertama
+          self.nick = self._generate_nickname()
+          self._send(f"NICK {self.nick}")
+
+          time.sleep(0.5)
+          self._send(f"USER {self.ident} 0 * :{self.fullname}")
+
+          self.emit_to_web('IRC_STATUS', {'status': 'connecting', 'nick': self.nick})
+
+          # Start registration timeout check
+          threading.Thread(target=self._check_registration_timeout, daemon=True).start()
+
+          return True
+
+      except Exception as e:
+          print(f"❌ Connection failed: {e}")
+          self.emit_to_web('IRC_STATUS', {'status': 'error', 'message': str(e)})
+          return False
+
+    def _generate_nickname(self):
+      """Generate random nickname"""
+      import random
+      import string
+
+      # Base name
+      base = "webuser"
+
+      # Generate 4-digit random number
+      random_num = random.randint(1000, 9999)
+
+      # Atau generate random string
+      random_chars = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+
+      # Pilih salah satu format
+      nickname = f"{base}_{random_num}"
+
+      print(f"Generated nickname: {nickname}")
+      return nickname
+
+    def _handle_numeric(self, line, numeric):
+      """Handle numeric responses termasuk NICK IN USE"""
+
+      print(f"[NUMERIC {numeric}] {line}")
+
+      # 433: NICKNAME IN USE
+      if numeric == '433':
+          print(f"⚠️ Nickname {self.nick} is already in use, generating new one...")
+
+          # Generate new nickname
+          new_nick = self._generate_nickname()
+          self.nick = new_nick
+
+          # Send new NICK command
+          self._send(f"NICK {new_nick}")
+
+          # Emit to web
+          self.emit_to_web('IRC_STATUS', {
+              'status': 'nick_change',
+              'old_nick': self.nick,
+              'new_nick': new_nick
+          })
+          return
+
+      # 001: Welcome
+      if numeric == '001':
+          self.registered = True
+          print(f"✅ Registered as {self.nick}")
+
+          self.emit_to_web('IRC_STATUS', {
+              'status': 'connected', 
+              'nick': self.nick,
+              'server': self.current_server or self.server_name
+          })
+
+          self._process_auto_join()
+
+      # ... (rest of numeric handling tetap sama)
+
+    def _check_registration_timeout(self):
+        start_time = time.time()
+        while time.time() - start_time < self.registration_timeout:
+            if self.registered:
+                return
+            time.sleep(1)
+
+        if not self.registered:
+            print("❌ Registration timeout!")
+
+    def _send(self, message):
+        if self.sock:
+            try:
+                self.sock.send(f"{message}\r\n".encode('utf-8'))
+                print(f"[SEND] {message}")
+                return True
+            except Exception as e:
+                print(f"❌ Send failed: {e}")
+                return False
+        return False
+
+    def _receive_loop(self):
+        buffer = ""
+
+        while self.running and self.connected:
+            try:
+                self.sock.settimeout(1)
+                data = self.sock.recv(4096)
+
+                if not data:
+                    print("❌ Connection closed by server")
+                    break
+
+                buffer += data.decode('utf-8', errors='ignore')
+
+                while '\r\n' in buffer:
+                    line, buffer = buffer.split('\r\n', 1)
+                    if line:
+                        self._process_line(line)
+
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"❌ Receive error: {e}")
+                break
+
+        print("Receive loop ended")
+        self.connected = False
+        self.emit_to_web('IRC_STATUS', {'status': 'disconnected'})
+
+    def _process_line(self, line):
+        print(f"[RECV] {line}")
+
+        # PING-PONG
+        if line.startswith('PING :'):
+            ping_token = line.split(':', 1)[1] if ':' in line else ''
+            self._send(f"PONG {ping_token}")
+
+        # NUMERIC RESPONSES
+        parts = line.split(' ')
+        if len(parts) > 1 and parts[1].isdigit():
+            numeric = parts[1]
+            self._handle_numeric(line, numeric)
+
+        # PRIVMSG
+        elif 'PRIVMSG' in line:
+            self._handle_privmsg(line)
+
+        # JOIN/PART/QUIT/NICK
+        elif 'JOIN' in line:
+            self._handle_join(line)
+        elif 'PART' in line:
+            self._handle_part(line)
+        elif 'QUIT' in line:
+            self._handle_quit(line)
+        elif 'NICK' in line:
+            self._handle_nick_change(line)
+        elif 'NOTICE' in line:
+            self._handle_notice(line)
+        elif 'MODE' in line:
+            self._handle_mode(line)
+
+    def _handle_numeric(self, line, numeric):
+        """Handle numeric responses termasuk WHOIS"""
+
+        print(f"[NUMERIC {numeric}] {line}")
+
+        # 001: Welcome
+        if numeric == '001':
+            self.registered = True
+            print(f"✅ Registered as {self.nick}")
+
+            self.emit_to_web('IRC_STATUS', {
+                'status': 'connected', 
+                'nick': self.nick,
+                'server': self.current_server or self.server_name
+            })
+
+            self._process_auto_join()
+
+        # 353: NAMES LIST
+        elif numeric == '353':
+            self._handle_names_list_fixed(line)
+
+        # 366: END OF NAMES
+        elif numeric == '366':
+            self._handle_end_of_names(line)
+
+        # 311-319, 330, 335, 344, 671: WHOIS responses
+        elif numeric in ['311', '312', '317', '318', '319', '330', '335', '344', '671']:
+            self._handle_whois_response(line, numeric)
+
+        # 332: Topic
+        elif numeric == '332':
+            self._handle_topic(line)
+
+        # Channel errors
+        elif numeric in ['471', '473', '474', '475']:
+            self._handle_channel_error(line, numeric)
+
+    def _handle_whois_response(self, line, numeric):
+        """Handle WHOIS responses"""
+        try:
+            parts = line.split(' ')
+            if len(parts) < 4:
+                return
+
+            # Extract target nick (usually in position 3)
+            target_nick = parts[3]
+
+            if target_nick not in self.whois_data:
+                self.whois_data[target_nick] = {
+                    'whois': {},
+                    'channels': [],
+                    'server': '',
+                    'idle': '',
+                    'signon': '',
+                    'registered': False,
+                    'bot': False,
+                    'secure': False,
+                    'location': '',
+                    'account': ''
+                }
+
+            # Parse based on numeric
+            if numeric == '311':  # RPL_WHOISUSER
+                # :server 311 requestor nick user host * :realname
+                if len(parts) >= 7:
+                    user = parts[4]
+                    host = parts[5]
+                    realname = ' '.join(parts[7:])[1:] if len(parts) > 7 else ""
+                    self.whois_data[target_nick]['whois'] = {
+                        'user': user,
+                        'host': host,
+                        'realname': realname
+                    }
+
+                    # Emit to web
+                    self.emit_to_web('IRC_WHOIS', {
+                        'nick': target_nick,
+                        'type': 'whois_user',
+                        'user': user,
+                        'host': host,
+                        'realname': realname
+                    })
+
+            elif numeric == '312':  # RPL_WHOISSERVER
+                # :server 312 requestor nick server :server_info
+                if len(parts) >= 5:
+                    server = parts[4]
+                    server_info = ' '.join(parts[5:])[1:] if len(parts) > 5 else ""
+                    self.whois_data[target_nick]['server'] = f"{server} ({server_info})"
+
+            elif numeric == '317':  # RPL_WHOISIDLE
+                # :server 317 requestor nick idle signon :seconds idle, signon time
+                if len(parts) >= 6:
+                    idle = parts[4]
+                    signon = parts[5]
+                    self.whois_data[target_nick]['idle'] = idle
+                    self.whois_data[target_nick]['signon'] = signon
+
+                    # Convert Unix timestamp to readable time
+                    try:
+                        signon_time = datetime.fromtimestamp(int(signon))
+                        idle_min = int(idle) // 60
+                        self.emit_to_web('IRC_WHOIS', {
+                            'nick': target_nick,
+                            'type': 'whois_idle',
+                            'idle_minutes': idle_min,
+                            'signon_time': signon_time.strftime("%Y-%m-%d %H:%M:%S")
+                        })
+                    except:
+                        pass
+
+            elif numeric == '319':  # RPL_WHOISCHANNELS
+                # :server 319 requestor nick :channels
+                if len(parts) >= 5:
+                    channels = ' '.join(parts[4:])[1:] if ':' in parts[4] else ' '.join(parts[4:])
+                    self.whois_data[target_nick]['channels'] = channels.split()
+
+            elif numeric == '330':  # RPL_WHOISACCOUNT
+                # :server 330 requestor nick account :is logged in as
+                if len(parts) >= 6:
+                    account = parts[4]
+                    self.whois_data[target_nick]['account'] = account
+                    self.whois_data[target_nick]['registered'] = True
+
+                    self.emit_to_web('IRC_WHOIS', {
+                        'nick': target_nick,
+                        'type': 'whois_account',
+                        'account': account
+                    })
+
+            elif numeric == '307':  # RPL_WHOISREGNICK
+                # :server 307 requestor nick :is a registered nick
+                self.whois_data[target_nick]['registered'] = True
+
+            elif numeric == '335':  # RPL_WHOISBOT
+                # :server 335 requestor nick :is a bot
+                self.whois_data[target_nick]['bot'] = True
+
+            elif numeric == '344':  # RPL_WHOISACTUALLY
+                # :server 344 requestor nick user@host :is connecting from
+                if len(parts) >= 5:
+                    location = ' '.join(parts[5:])[1:] if len(parts) > 5 else ""
+                    self.whois_data[target_nick]['location'] = location
+
+            elif numeric == '671':  # RPL_WHOISSECURE
+                # :server 671 requestor nick :is using a secure connection
+                self.whois_data[target_nick]['secure'] = True
+
+            elif numeric == '318':  # RPL_ENDOFWHOIS
+                # End of WHOIS
+                self.emit_to_web('IRC_WHOIS', {
+                    'nick': target_nick,
+                    'type': 'whois_end',
+                    'data': self.whois_data[target_nick]
+                })
+
+                # Clean up after sending
+                if target_nick in self.whois_data:
+                    del self.whois_data[target_nick]
+
+        except Exception as e:
+            print(f"❌ Error parsing WHOIS {numeric}: {e}")
+
+    def _process_auto_join(self):
+        if self.auto_join_channels:
+            print(f"Auto-joining {len(self.auto_join_channels)} channels...")
+            for channel in self.auto_join_channels[:]:
+                self._join_channel_with_retry(channel)
+                time.sleep(1)
+
+    def _join_channel_with_retry(self, channel):
+        if channel not in self.join_retry_count:
+            self.join_retry_count[channel] = 0
+
+        if self.join_retry_count[channel] >= self.max_join_retries:
+            print(f"❌ Max retries reached for {channel}")
+            return
+
+        self.join_retry_count[channel] += 1
+        print(f"Joining {channel} (attempt {self.join_retry_count[channel]})...")
+        self._send(f"JOIN {channel}")
+
+    def _handle_names_list_fixed(self, line):
+        """Handle 353 dengan parsing prefix yang betul"""
+        try:
+            parts = line.split(' ')
+
+            if len(parts) < 5:
+                return
+
+            channel = None
+            for part in parts:
+                if part.startswith('#'):
+                    channel = part
+                    break
+
+            if not channel:
+                return
+
+            nicks_raw = ""
+            for i in range(len(parts)):
+                if parts[i].startswith(':'):
+                    nicks_raw = ' '.join(parts[i:])[1:]
+                    break
+
+            if not nicks_raw:
+                return
+
+            # Initialize buffer
+            if channel not in self.nicklist_buffer:
+                self.nicklist_buffer[channel] = []
+
+            # Process each nick with prefixes
+            nicks_list = nicks_raw.split(' ')
+            for nick in nicks_list:
+                if nick and nick not in self.nicklist_buffer[channel]:
+                    self.nicklist_buffer[channel].append(nick)
+
+            print(f"[353] {channel}: Got {len(nicks_list)} nicks")
+
+        except Exception as e:
+            print(f"❌ Error parsing 353: {e}")
+
+    def _handle_end_of_names(self, line):
+        try:
+            parts = line.split(' ')
+            if len(parts) >= 4:
+                channel = parts[3]
+
+                print(f"[366] End of NAMES for {channel}")
+
+                if channel in self.nicklist_buffer:
+                    # Ensure channel exists
+                    if channel not in self.channels:
+                        self.channels[channel] = {'nicks': [], 'messages': [], 'topic': ''}
+
+                    # Update nicklist dengan prefix yang betul
+                    all_nicks = []
+                    for nick in self.nicklist_buffer[channel]:
+                        if nick and nick not in all_nicks:
+                            all_nicks.append(nick)
+
+                    self.channels[channel]['nicks'] = all_nicks
+
+                    # Emit ke web
+                    self.emit_to_web('IRC_NICKLIST', {
+                        'channel': channel,
+                        'nicks': all_nicks
+                    })
+
+                    print(f"[366] {channel}: Total {len(all_nicks)} nicks")
+
+                    # Clear buffer
+                    del self.nicklist_buffer[channel]
+
+                    # Remove from pending
+                    if channel in self.pending_names:
+                        del self.pending_names[channel]
+
+        except Exception as e:
+            print(f"❌ Error parsing 366: {e}")
+
+    def _handle_topic(self, line):
+        try:
+            parts = line.split(' ')
+            if len(parts) >= 4:
+                channel = parts[3]
+                topic = ' '.join(parts[4:])[1:] if len(parts) > 4 else ""
+
+                if channel not in self.channels:
+                    self.channels[channel] = {'nicks': [], 'messages': [], 'topic': ''}
+
+                self.channels[channel]['topic'] = topic
+
+                self.emit_to_web('IRC_TOPIC', {
+                    'channel': channel,
+                    'topic': topic
+                })
+
+        except:
+            pass
+
+    def _handle_channel_error(self, line, numeric):
+        try:
+            parts = line.split(' ')
+            if len(parts) >= 4:
+                channel = parts[3]
+                error_msg = ' '.join(parts[4:])[1:] if len(parts) > 4 else ""
+
+                error_types = {
+                    '471': 'Channel is full',
+                    '473': 'Invite only channel',
+                    '474': 'Banned from channel',
+                    '475': 'Bad channel key'
+                }
+
+                error_text = error_types.get(numeric, 'Unknown error')
+
+                self.emit_to_web('IRC_ERROR', {
+                    'channel': channel,
+                    'message': f'{error_text}: {error_msg}'
+                })
+
+                print(f"❌ Join error for {channel}: {error_text}")
+
+        except:
+            pass
+
+    def _extract_user_host(self, prefix):
+        if '!' in prefix and '@' in prefix:
+            if prefix.startswith(':'):
+                prefix = prefix[1:]
+            try:
+                nick_part, host_part = prefix.split('!', 1)
+                user_part, host = host_part.split('@', 1)
+                return f"{user_part}@{host}"
+            except:
+                return prefix.split('!')[-1]
+        return "unknown@unknown"
+
+    def _handle_privmsg(self, line):
+        """Handle PRIVMSG untuk channel dan private messages"""
+        try:
+            match = re.match(r'^:([^ ]+) PRIVMSG ([^ ]+) :(.+)$', line)
+            if not match:
+                return
+
+            prefix = match.group(1)
+            target = match.group(2)
+            raw_message = match.group(3)
+
+            sender = prefix.split('!')[0] if '!' in prefix else prefix
+            user_host = self._extract_user_host(prefix)
+            self.user_host_cache[sender] = user_host
+
+            processed_message = self._process_color_codes(raw_message)
+
+            # Check if this is a private message (not a channel)
+            if not target.startswith('#'):
+                # It's a private message TO us
+                if target == self.nick:
+                    self._handle_private_message(sender, processed_message, raw_message)
+                    return
+
+            # Channel message
+            if target.startswith('#'):
+                if target not in self.channels:
+                    self.channels[target] = {'nicks': [], 'messages': [], 'topic': ''}
+                    print(f"Created channel entry for {target} from PRIVMSG")
+
+                msg_entry = {
+                    'sender': sender,
+                    'user_host': user_host,
+                    'message': processed_message,
+                    'raw_message': raw_message,
+                    'time': datetime.now().strftime("%I:%M:%S%p").lower(),
+                    'type': 'channel'
+                }
+
+                # Simpan dalam channel history (max 1000 messages)
+                if 'messages' not in self.channels[target]:
+                    self.channels[target]['messages'] = []
+
+                self.channels[target]['messages'].append(msg_entry)
+
+                # Keep only last 1000 messages
+                if len(self.channels[target]['messages']) > 1000:
+                    self.channels[target]['messages'] = self.channels[target]['messages'][-1000:]
+
+                # Emit ke web
+                self.emit_to_web('IRC_MESSAGE', {
+                    'type': 'channel',
+                    'sender': sender,
+                    'user_host': user_host,
+                    'channel': target,
+                    'message': processed_message,
+                    'raw_message': raw_message,
+                    'timestamp': datetime.now().strftime("%I:%M:%S%p").lower()
+                })
+
+                print(f"[PRIVMSG] {sender} in {target}: {raw_message[:50]}...")
+
+        except Exception as e:
+            print(f"❌ Error parsing PRIVMSG: {e}")
+
+    def _handle_private_message(self, sender, message, raw_message):
+        """Handle private/direct messages"""
+        try:
+            print(f"[PM] {sender} -> {self.nick}: {message}")
+
+            # Initialize PM storage if needed
+            if sender not in self.private_messages:
+                self.private_messages[sender] = []
+
+            # Store message
+            pm_entry = {
+                'sender': sender,
+                'message': message,
+                'raw_message': raw_message,
+                'time': datetime.now().strftime("%I:%M:%S%p").lower(),
+                'is_self': False
+            }
+
+            self.private_messages[sender].append(pm_entry)
+
+            # Keep only last 200 messages per user
+            if len(self.private_messages[sender]) > 200:
+                self.private_messages[sender] = self.private_messages[sender][-200:]
+
+            # Emit to web
+            self.emit_to_web('IRC_PM', {
+                'type': 'pm_received',
+                'sender': sender,
+                'message': message,
+                'raw_message': raw_message,
+                'timestamp': datetime.now().strftime("%I:%M:%S%p").lower()
+            })
+
+        except Exception as e:
+            print(f"❌ Error handling PM: {e}")
+
+    def send_private_message(self, target, message):
+        """Send private message"""
+        if self.send_message(target, message):
+            # Store in our own PM history
+            if target not in self.private_messages:
+                self.private_messages[target] = []
+
+            pm_entry = {
+                'sender': self.nick,
+                'message': message,
+                'raw_message': message,
+                'time': datetime.now().strftime("%I:%M:%S%p").lower(),
+                'is_self': True
+            }
+
+            self.private_messages[target].append(pm_entry)
+
+            # Emit to web
+            self.emit_to_web('IRC_PM', {
+                'type': 'pm_sent',
+                'target': target,
+                'message': message,
+                'timestamp': datetime.now().strftime("%I:%M:%S%p").lower()
+            })
+
+            return True
+        return False
+
+    def _process_color_codes(self, text):
+        if not text:
+            return text
+
+        # Replace IRC color codes
+        def replace_color(match):
+            if match.group(2):
+                fg = match.group(1)
+                bg = match.group(2)
+                return f'<span class="irc-fg-{fg} irc-bg-{bg}">'
+            else:
+                fg = match.group(1)
+                return f'<span class="irc-fg-{fg}">'
+
+        text = re.sub(r'\x03(\d{1,2})(?:,(\d{1,2}))?', replace_color, text)
+        text = text.replace('\x02', '<strong>')
+        text = text.replace('\x0f', '</span></strong>')
+        text = text.replace('\x16', '</span>')
+        text = text.replace('\x03', '</span>')
+
+        return text
+
+    def _handle_join(self, line):
+        try:
+            print(f"[JOIN RAW] {line}")
+
+            match = re.match(r'^:([^ ]+) JOIN :?(#[^ ]+)$', line)
+            if not match:
+                parts = line.split(' ')
+                if len(parts) >= 3 and parts[1] == 'JOIN':
+                    prefix = parts[0]
+                    channel = parts[2]
+                    if channel.startswith(':'):
+                        channel = channel[1:]
+                else:
+                    return
+
+            else:
+                prefix = match.group(1)
+                channel = match.group(2)
+
+            nick = prefix.split('!')[0] if '!' in prefix else prefix
+            user_host = self._extract_user_host(prefix)
+
+            print(f"[JOIN] {nick} joined {channel} ({user_host})")
+
+            self.user_host_cache[nick] = user_host
+
+            if nick == self.nick:
+                print(f"✅ WE joined {channel}")
+
+                if channel not in self.channels:
+                    self.channels[channel] = {'nicks': [self.nick], 'messages': [], 'topic': ''}
+                    print(f"Created channel {channel} in tracking")
+
+                self.emit_to_web('IRC_CHANNEL_ADD', {
+                    'channel': channel,
+                    'topic': ''
+                })
+
+                def request_names():
+                    print(f"Requesting NAMES for {channel}...")
+                    self._send(f"NAMES {channel}")
+                    self.pending_names[channel] = time.time()
+
+                threading.Timer(2.0, request_names).start()
+
+                if channel in self.join_retry_count:
+                    del self.join_retry_count[channel]
+
+                if channel in self.auto_join_channels:
+                    self.auto_join_channels.remove(channel)
+
+            elif channel in self.channels:
+                if nick not in self.channels[channel]['nicks']:
+                    self.channels[channel]['nicks'].append(nick)
+                    print(f"Added {nick} to {channel} nicks list")
+
+            self.emit_to_web('IRC_JOIN', {
+                'nick': nick,
+                'user_host': user_host,
+                'channel': channel,
+                'timestamp': datetime.now().strftime("%I:%M:%S%p").lower()
+            })
+
+            if channel in self.channels:
+                self.emit_to_web('IRC_NICKLIST', {
+                    'channel': channel,
+                    'nicks': self.channels[channel]['nicks']
+                })
+
+        except Exception as e:
+            print(f"❌ Error in JOIN handler: {e}")
+
+    def _handle_part(self, line):
+        try:
+            match = re.match(r'^:([^ ]+) PART (#[^ ]+)(?: :(.+))?$', line)
+            if not match:
+                return
+
+            prefix = match.group(1)
+            channel = match.group(2)
+            reason = match.group(3) or ""
+
+            nick = prefix.split('!')[0] if '!' in prefix else prefix
+            user_host = self.user_host_cache.get(nick, "unknown@unknown")
+
+            print(f"[PART] {nick} left {channel}")
+
+            if channel in self.channels and nick in self.channels[channel].get('nicks', []):
+                self.channels[channel]['nicks'].remove(nick)
+
+            self.emit_to_web('IRC_PART', {
+                'nick': nick,
+                'user_host': user_host,
+                'channel': channel,
+                'reason': reason,
+                'timestamp': datetime.now().strftime("%I:%M:%S%p").lower()
+            })
+
+            if nick == self.nick and channel in self.channels:
+                print(f"WE left {channel}")
+                del self.channels[channel]
+                self.emit_to_web('IRC_CHANNEL_REMOVE', {'channel': channel})
+
+            if channel in self.channels:
+                self.emit_to_web('IRC_NICKLIST', {
+                    'channel': channel,
+                    'nicks': self.channels[channel]['nicks']
+                })
+
+        except Exception as e:
+            print(f"❌ Error in PART handler: {e}")
+
+    def _handle_quit(self, line):
+        try:
+            match = re.match(r'^:([^ ]+) QUIT(?: :(.+))?$', line)
+            if not match:
+                return
+
+            prefix = match.group(1)
+            message = match.group(2) or ""
+
+            nick = prefix.split('!')[0] if '!' in prefix else prefix
+            user_host = self._extract_user_host(prefix)
+
+            print(f"[QUIT] {nick} quit")
+
+            self.user_host_cache[nick] = user_host
+
+            for channel in self.channels:
+                if nick in self.channels[channel].get('nicks', []):
+                    self.channels[channel]['nicks'].remove(nick)
+
+                    self.emit_to_web('IRC_NICKLIST', {
+                        'channel': channel,
+                        'nicks': self.channels[channel]['nicks']
+                    })
+
+            self.emit_to_web('IRC_QUIT', {
+                'nick': nick,
+                'user_host': user_host,
+                'message': message,
+                'timestamp': datetime.now().strftime("%I:%M:%S%p").lower()
+            })
+
+        except Exception as e:
+            print(f"❌ Error in QUIT handler: {e}")
+
+    def _handle_nick_change(self, line):
+        try:
+            match = re.match(r'^:([^ ]+) NICK :?(.+)$', line)
+            if not match:
+                return
+
+            prefix = match.group(1)
+            new_nick = match.group(2)
+
+            old_nick = prefix.split('!')[0] if '!' in prefix else prefix
+            user_host = self.user_host_cache.get(old_nick, "unknown@unknown")
+
+            print(f"[NICK] {old_nick} → {new_nick}")
+
+            self.user_host_cache[new_nick] = user_host
+            if old_nick in self.user_host_cache:
+                del self.user_host_cache[old_nick]
+
+            if old_nick == self.nick:
+                self.nick = new_nick
+                print(f"Our nick changed to {new_nick}")
+
+            for channel in self.channels:
+                if old_nick in self.channels[channel].get('nicks', []):
+                    idx = self.channels[channel]['nicks'].index(old_nick)
+                    self.channels[channel]['nicks'][idx] = new_nick
+
+                    self.emit_to_web('IRC_NICKLIST', {
+                        'channel': channel,
+                        'nicks': self.channels[channel]['nicks']
+                    })
+
+            self.emit_to_web('IRC_NICK_CHANGE', {
+                'old_nick': old_nick,
+                'new_nick': new_nick,
+                'user_host': user_host,
+                'timestamp': datetime.now().strftime("%I:%M:%S%p").lower()
+            })
+
+        except Exception as e:
+            print(f"❌ Error in NICK handler: {e}")
+
+    def _handle_notice(self, line):
+        print(f"[NOTICE] {line}")
+
+    def _handle_mode(self, line):
+        print(f"[MODE] {line}")
+
+    # PUBLIC METHODS
+    def send_message(self, target, message):
+        return self._send(f"PRIVMSG {target} :{message}")
+
+    def join_channel(self, channel):
+        if not channel.startswith('#'):
+            channel = f"#{channel}"
+
+        print(f"🚀 Joining channel: {channel}")
+
+        if not self.registered:
+            print(f"Not registered yet, queuing {channel}")
+            if channel not in self.auto_join_channels:
+                self.auto_join_channels.append(channel)
+            return True
+
+        return self._join_channel_with_retry(channel)
+
+    def part_channel(self, channel, message=""):
+        if message:
+            return self._send(f"PART {channel} :{message}")
+        else:
+            return self._send(f"PART {channel}")
+
+    def change_nick(self, new_nick):
+        return self._send(f"NICK {new_nick}")
+
+    def whois(self, nick):
+        """Send WHOIS command"""
+        return self._send(f"WHOIS {nick}")
+
+    def get_channels(self):
+        return list(self.channels.keys())
+
+    def get_channel_info(self, channel):
+        return self.channels.get(channel)
+
+    def get_pm_history(self, nick):
+        """Get PM history with a user"""
+        return self.private_messages.get(nick, [])
+
+    def set_current_channel(self, channel):
+        """Set which channel is currently active in view"""
+        self.current_channel = channel
+
+    def disconnect(self):
+        self.running = False
+        self.connected = False
+
+        if self.sock:
+            try:
+                self._send("QUIT :KampungChat Web")
+                time.sleep(0.5)
+                self.sock.close()
+            except:
+                pass
+
+        self.emit_to_web('IRC_STATUS', {'status': 'disconnected'})
+        print("IRC Client disconnected")
+
+# ============================================================================
+# PART 2: FLASK WEB SERVER
+# ============================================================================
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Global IRC Client
+irc_client = None
+irc_thread = None
+
+# HTML TEMPLATE (updated radio URL)
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Kampung IRC — Radio Terpadu</title>
+
+<style>
+/* CSS sama seperti sebelumnya, tapi update untuk PM/DM */
+:root{
+  --left-width:260px;
+  --bg-dark:#1e1e1e;
+  --bg-darker:#111;
+  --bg-medium:#252525;
+  --bg-light:#2a2a2a;
+  --border:#444;
+  --text:#fff;
+  --btn:#252525;
+  --btn-h:#111;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{
+  width:100%;height:100%;overflow:hidden;
+  font-family:monospace,Arial,sans-serif;
+  background:var(--bg-dark);color:var(--text);
+}
+
+/* HEADER */
+header{
+  background:var(--bg-medium);
+  padding:8px 10px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  height:45px;
+  border-bottom:2px solid var(--border);
+  font-family:Arial,sans-serif;
+}
+.header-center{
+  position:absolute;
+  left:50%;
+  transform:translateX(-50%);
+  font-weight:bold;
+}
+
+/* STATUS BADGE */
+.status-badge{
+  padding:3px 8px;
+  border-radius:12px;
+  font-size:12px;
+  margin-right:8px;
+}
+.status-connected{background:#2ecc71;color:white}
+.status-disconnected{background:#e74c3c;color:white}
+.status-connecting{background:#f39c12;color:white}
+
+/* GRID */
+main{
+  display:grid;
+  grid-template-columns: var(--left-width) 6px 1fr 160px 160px;
+  height:calc(100vh - 90px);
+}
+
+/* LEFT PANEL (RADIO) - TUKAR URL */
+#leftbox{
+  background:var(--bg-light);
+  padding:8px;
+  display:flex;
+  flex-direction:column;
+  border-right:1px solid var(--border);
+}
+.radio-title{
+  margin-bottom:8px;
+  font-size:14px;
+  font-family:Arial,sans-serif;
+}
+.radio-frame{
+  flex:1;
+  border:none;
+  border-radius:4px;
+  background:#000;
+}
+
+/* RESIZER */
+#resizer{
+  cursor:col-resize;
+  background:var(--border);
+}
+#resizer:hover{background:#666}
+
+/* CHAT ROOM */
+#chatroom{
+  background:var(--bg-darker);
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+}
+#chatroom header{
+  background:var(--bg-medium);
+  padding:8px 12px;
+  font-size:14px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  flex-shrink:0;
+}
+.channel-title{
+  font-weight:bold;
+  color:#3498db;
+  font-family:Arial,sans-serif;
+}
+.chat-content{
+  flex:1;
+  padding:8px 12px;
+  overflow-y:auto;
+  background:var(--bg-light);
+  font-size:13px;
+  line-height:1.3;
+  font-family:monospace;
+  min-height:0;
+}
+.chat-message{
+  margin:4px 0;
+  padding:6px 8px;
+  background:var(--bg-medium);
+  border-radius:4px;
+  border-left:2px solid #3498db;
+  word-break:break-word;
+}
+.chat-message.system{
+  border-left-color:#f39c12;
+  font-style:italic;
+  font-size:12px;
+  background:#2a2520;
+}
+.chat-message.me{
+  border-left-color:#2ecc71;
+  background:#1e2a1e;
+}
+.chat-message.join-part{
+  border-left-color:#9b59b6;
+  background:#2a1e2a;
+  font-size:12px;
+}
+.chat-message.pm{
+  border-left-color:#e74c3c;
+  background:#2a1e1e;
+}
+.message-nick{
+  font-weight:bold;
+  color:#3498db;
+  margin-right:6px;
+}
+.message-time{
+  font-size:11px;
+  color:#888;
+  margin-right:8px;
+  font-family:monospace;
+}
+.message-userhost{
+  font-size:10px;
+  color:#666;
+  margin-left:6px;
+  font-family:monospace;
+}
+
+/* WHOIS INFO BOX */
+.whois-box{
+  background:var(--bg-darker);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:10px;
+  margin:10px 0;
+  font-size:12px;
+  line-height:1.4;
+}
+.whois-title{
+  font-weight:bold;
+  color:#3498db;
+  margin-bottom:5px;
+  border-bottom:1px solid var(--border);
+  padding-bottom:3px;
+}
+.whois-line{
+  margin:3px 0;
+  padding-left:10px;
+}
+.whois-label{
+  color:#f39c12;
+  font-weight:bold;
+  margin-right:5px;
+}
+
+/* NICKLIST - FIX PREFIXES */
+#nicklist{
+  background:var(--bg-light);
+  padding:12px;
+  border-left:2px solid var(--border);
+  overflow-y:auto;
+  font-family:monospace;
+}
+.nicklist-title{
+  margin-bottom:10px;
+  font-weight:bold;
+  font-size:14px;
+  color:#3498db;
+  font-family:Arial,sans-serif;
+}
+.nick-item{
+  padding:6px 8px;
+  margin:3px 0;
+  background:var(--bg-medium);
+  border-radius:4px;
+  cursor:pointer;
+  font-size:12px;
+  display:flex;
+  align-items:center;
+}
+.nick-item:hover{
+  background:var(--border);
+}
+.nick-prefix{
+  margin-right:4px;
+  font-weight:bold;
+}
+.nick-prefix.owner{color:#f39c12}  /* ~ */
+.nick-prefix.admin{color:#e74c3c}   /* & */
+.nick-prefix.op{color:#e74c3c}      /* @ */
+.nick-prefix.half-op{color:#9b59b6} /* % */
+.nick-prefix.voice{color:#2ecc71}   /* + */
+
+/* RIGHT COLUMN */
+#rightcol{
+  display:flex;
+  flex-direction:column;
+  background:var(--bg-medium);
+  min-height:0;
+}
+#chanlist, #bottombox{
+  flex:1;
+  margin:8px;
+  background:var(--bg-light);
+  border-radius:6px;
+  padding:12px;
+  overflow-y:auto;
+  min-height:0;
+}
+.section-title{
+  margin-bottom:10px;
+  font-weight:bold;
+  font-size:14px;
+  color:#3498db;
+  font-family:Arial,sans-serif;
+}
+
+/* CHANNEL LIST */
+.channel-item{
+  padding:8px 10px;
+  margin:5px 0;
+  background:var(--bg-medium);
+  border-radius:4px;
+  cursor:pointer;
+  font-size:13px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  font-family:monospace;
+}
+.channel-item.active{
+  background:#3498db;
+  color:white;
+}
+.channel-users{
+  font-size:11px;
+  color:#888;
+}
+
+/* DM LIST */
+.dm-item{
+  padding:8px 10px;
+  margin:5px 0;
+  background:var(--bg-medium);
+  border-radius:4px;
+  cursor:pointer;
+  font-size:13px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  font-family:monospace;
+}
+.dm-item.active{
+  background:#e74c3c;
+  color:white;
+}
+.dm-unread{
+  background:#e74c3c;
+  color:white;
+  padding:2px 6px;
+  border-radius:10px;
+  font-size:10px;
+  margin-left:5px;
+}
+
+/* FOOTER */
+footer{
+  height:40px;
+  background:var(--bg-medium);
+  display:flex;
+  align-items:center;
+  padding:4px 6px;
+  border-top:2px solid var(--border);
+}
+form{
+  flex:1;
+  display:flex;
+  gap:6px;
+}
+input{
+  flex:1;
+  padding:8px 10px;
+  background:var(--bg-light);
+  border:1px solid var(--border);
+  color:var(--text);
+  border-radius:4px;
+  font-size:13px;
+  font-family:monospace;
+}
+input:focus{
+  outline:none;
+  border-color:#3498db;
+}
+button{
+  padding:8px 16px;
+  background:#3498db;
+  color:white;
+  border:none;
+  border-radius:4px;
+  cursor:pointer;
+  font-weight:bold;
+  font-size:13px;
+  font-family:Arial,sans-serif;
+}
+button:hover{
+  background:#2980b9;
+}
+
+/* SCROLLBAR */
+::-webkit-scrollbar{width:8px}
+::-webkit-scrollbar-track{background:var(--bg-medium)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:#555}
+
+/* MOBILE */
+@media(max-width:900px){
+  main{
+    grid-template-columns:1fr;
+    height:calc(100vh - 85px);
+  }
+  #resizer,#nicklist,#rightcol{display:none}
+  #leftbox{padding:6px}
+  .chat-content{padding:6px 10px}
+}
+
+/* IRC COLOR CODES */
+.irc-fg-0{color:#fff}
+.irc-fg-1{color:#000}
+.irc-fg-2{color:#00007f}
+.irc-fg-3{color:#009300}
+.irc-fg-4{color:#ff0000}
+.irc-fg-5{color:#7f0000}
+.irc-fg-6{color:#9c009c}
+.irc-fg-7{color:#fc7f00}
+.irc-fg-8{color:#ffff00}
+.irc-fg-9{color:#00fc00}
+.irc-fg-10{color:#009393}
+.irc-fg-11{color:#00ffff}
+.irc-fg-12{color:#0000fc}
+.irc-fg-13{color:#ff00ff}
+.irc-fg-14{color:#7f7f7f}
+.irc-fg-15{color:#d2d2d2}
+</style>
+
+<!-- Socket.IO -->
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+</head>
+
+<body>
+
+<header>
+  <div>
+    <span id="statusBadge" class="status-badge status-disconnected">❌ Disconnected</span>
+    <span id="currentNick">Not connected</span>
+  </div>
+  <div class="header-center">
+    🐥 KampungChat IRC 🐔
+  </div>
+  <div>
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
+    <button id="toggleMode">🌙</button>
+  </div>
+</header>
+
+<main>
+  <!-- LEFT: RADIO - TUKAR URL -->
+  <div id="leftbox">
+    <div class="radio-title">📻 Radio KampungChat</div>
+    <iframe id="radioFrame" 
+            src="https://radio.kcfm.org" 
+            class="radio-frame">
+    </iframe>
+  </div>
+
+  <!-- RESIZER -->
+  <div id="resizer" title="Drag untuk resize | Double click reset"></div>
+
+  <!-- MIDDLE: CHAT -->
+  <div id="chatroom">
+    <header>
+      <div class="channel-title">
+        <span id="currentChannel">💬 Not connected</span>
+        <span id="userCount" style="font-size:12px;margin-left:8px;"></span>
+      </div>
+      <div>
+        <button onclick="joinChannel()" style="padding:4px 8px;margin-right:4px;font-size:11px;">➕ Join</button>
+        <button onclick="leaveChannel()" style="padding:4px 8px;font-size:11px;">➖ Leave</button>
+      </div>
+    </header>
+    <div id="chatContent" class="chat-content">
+      <div class="chat-message system">
+        <span class="message-time" id="currentTime"></span>
+        Welcome to KampungChat IRC Web Client!
+      </div>
+      <div class="chat-message system">
+        <span class="message-time">00:00:00</span>
+        Click "Connect" button to join the chat.
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: NICKLIST -->
+  <aside id="nicklist">
+    <div class="nicklist-title">👥 Online Users (<span id="nickCount">0</span>)</div>
+    <div id="nicklistContent">
+      <div class="nick-item">(Not connected)</div>
+    </div>
+  </aside>
+
+  <!-- RIGHT COLUMN: CHANNEL LIST + DM -->
+  <aside id="rightcol">
+    <div id="chanlist">
+      <div class="section-title"># Channels (<span id="channelCount">0</span>)</div>
+      <div id="channelList">
+        <div class="channel-item">
+          <span>Not connected</span>
+        </div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:4px;">
+        <input id="joinChannelInput" placeholder="#channel" style="flex:1;padding:4px 6px;font-size:11px;">
+        <button onclick="quickJoin()" style="padding:4px 8px;font-size:11px;">Join</button>
+      </div>
+    </div>
+
+    <div id="bottombox">
+      <div class="section-title">💌 Direct Messages</div>
+      <div id="dmList">
+        <div style="padding:8px;color:#888;font-style:italic;font-size:12px;">
+          No private messages yet
+        </div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:4px;">
+        <input id="dmInput" placeholder="Nickname" style="flex:1;padding:4px 6px;font-size:11px;">
+        <button onclick="startDM()" style="padding:4px 8px;font-size:11px;">DM</button>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <div style="display:flex;align-items:center;gap:6px;margin-right:8px;">
+    <button onclick="toggleSmiley()" style="padding:6px;font-size:18px;background:none;border:none;cursor:pointer">😊</button>
+    <div id="smileyPanel" style="display:none;position:absolute;bottom:50px;background:var(--bg-medium);border:1px solid var(--border);border-radius:8px;padding:10px;z-index:1000;width:200px;">
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px;">
+        <button onclick="insertSmiley('😊')" style="font-size:20px;padding:5px;background:none;border:none;cursor:pointer">😊</button>
+        <button onclick="insertSmiley('😂')" style="font-size:20px;padding:5px;background:none;border:none;cursor:pointer">😂</button>
+        <button onclick="insertSmiley('❤️')" style="font-size:20px;padding:5px;background:none;border:none;cursor:pointer">❤️</button>
+        <button onclick="insertSmiley('🔥')" style="font-size:20px;padding:5px;background:none;border:none;cursor:pointer">🔥</button>
+        <button onclick="insertSmiley('🎉')" style="font-size:20px;padding:5px;background:none;border:none;cursor:pointer">🎉</button>
+        <button onclick="insertSmiley('👍')" style="font-size:20px;padding:5px;background:none;border:none;cursor:pointer">👍</button>
+        <button onclick="insertSmiley('😎')" style="font-size:20px;padding:5px;background:none;border:none;cursor:pointer">😎</button>
+        <button onclick="insertSmiley('🤔')" style="font-size:20px;padding:5px;background:none;border:none;cursor:pointer">🤔</button>
+      </div>
+    </div>
+  </div>
+  
+  <form id="chatForm" onsubmit="sendMessage();return false;" style="flex:1;display:flex;gap:6px;">
+    <input type="text" id="messageInput" placeholder="Type message or /command" autocomplete="off" />
+    <button type="submit">Send</button>
+  </form>
+</footer>
+
+<script>
+// ====== GLOBAL VARIABLES ======
+let socket = null;
+let connected = false;
+let currentChannel = null;
+let currentDM = null;
+let myNickname = '';
+let channels = {};
+let dms = {};
+let whoisData = {};
+
+// ====== UTILITY FUNCTIONS ======
+function formatTime() {
+  const now = new Date();
+  return now.toLocaleTimeString('en-US', { 
+    hour12: true, 
+    hour: '2-digit', 
+    minute: '2-digit',
+    second: '2-digit'
+  }).toLowerCase();
+}
+
+function updateTime() {
+  document.getElementById('currentTime').textContent = formatTime();
+}
+setInterval(updateTime, 1000);
+updateTime();
+
+function parseNickPrefix(nick) {
+  const prefixes = {
+    '~': { class: 'owner', display: '~', title: 'Channel Owner' },
+    '&': { class: 'admin', display: '&', title: 'Channel Admin' },
+    '@': { class: 'op', display: '@', title: 'Channel Operator' },
+    '%': { class: 'half-op', display: '%', title: 'Half-Operator' },
+    '+': { class: 'voice', display: '+', title: 'Voiced User' }
+  };
+
+  for (const [prefix, info] of Object.entries(prefixes)) {
+    if (nick.startsWith(prefix)) {
+      return {
+        prefix: prefix,
+        class: info.class,
+        display: info.display,
+        title: info.title,
+        cleanNick: nick.substring(1)
+      };
+    }
+  }
+
+  return {
+    prefix: '',
+    class: '',
+    display: '',
+    title: 'Normal User',
+    cleanNick: nick
+  };
+}
+
+function addChatMessage(type, nick, message, userHost = '', rawMessage = '') {
+  const container = document.getElementById('chatContent');
+  const msgDiv = document.createElement('div');
+
+  msgDiv.className = 'chat-message';
+  if (type === 'system' || type === 'join' || type === 'part' || type === 'quit') {
+    msgDiv.classList.add('system');
+    if (type === 'join' || type === 'part' || type === 'quit') {
+      msgDiv.classList.add('join-part');
+    }
+  } else if (type === 'pm') {
+    msgDiv.classList.add('pm');
+  } else if (type === 'me') {
+    msgDiv.classList.add('me');
+  }
+
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'message-time';
+  timeSpan.textContent = formatTime();
+
+  msgDiv.appendChild(timeSpan);
+
+  if (type === 'system') {
+    msgDiv.innerHTML += message;
+  } else if (type === 'whois') {
+    // Display WHOIS info in a box
+    const whoisBox = document.createElement('div');
+    whoisBox.className = 'whois-box';
+    whoisBox.innerHTML = message;
+    msgDiv.appendChild(whoisBox);
+  } else if (type === 'join') {
+    msgDiv.innerHTML = `* Joins: ${nick} (${userHost})`;
+  } else if (type === 'part') {
+    msgDiv.innerHTML = `* Parts: ${nick} (${userHost})`;
+  } else if (type === 'quit') {
+    msgDiv.innerHTML = `* Quits: ${nick} (${userHost})`;
+  } else if (type === 'me') {
+    const nickSpan = document.createElement('span');
+    nickSpan.className = 'message-nick';
+    nickSpan.textContent = `${nick}: `;
+    msgDiv.appendChild(nickSpan);
+    msgDiv.appendChild(document.createTextNode(message));
+  } else if (type === 'pm') {
+    const nickSpan = document.createElement('span');
+    nickSpan.className = 'message-nick';
+    nickSpan.textContent = `${nick} (PM): `;
+    msgDiv.appendChild(nickSpan);
+
+    const messageSpan = document.createElement('span');
+    messageSpan.innerHTML = message || rawMessage;
+    msgDiv.appendChild(messageSpan);
+  } else {
+    const nickInfo = parseNickPrefix(nick);
+    const nickSpan = document.createElement('span');
+    nickSpan.className = 'message-nick';
+    if (nickInfo.class) {
+      nickSpan.innerHTML = `<span class="nick-prefix ${nickInfo.class}" title="${nickInfo.title}">${nickInfo.display}</span>${nickInfo.cleanNick}: `;
+    } else {
+      nickSpan.textContent = `${nick}: `;
+    }
+    msgDiv.appendChild(nickSpan);
+
+    const messageSpan = document.createElement('span');
+    messageSpan.innerHTML = message || rawMessage;
+    msgDiv.appendChild(messageSpan);
+
+    if (userHost && userHost !== 'unknown@unknown') {
+      const hostSpan = document.createElement('span');
+      hostSpan.className = 'message-userhost';
+      hostSpan.textContent = ` (${userHost})`;
+      msgDiv.appendChild(hostSpan);
+    }
+  }
+
+  container.appendChild(msgDiv);
+  container.scrollTop = container.scrollHeight;
+}
+
+function updateStatus(status, nick = '') {
+  const badge = document.getElementById('statusBadge');
+  const nickSpan = document.getElementById('currentNick');
+  const connectBtn = document.getElementById('connectBtn');
+  const disconnectBtn = document.getElementById('disconnectBtn');
+
+  badge.className = 'status-badge';
+
+  if (status === 'connected') {
+    badge.classList.add('status-connected');
+    badge.textContent = '✅ Connected';
+    nickSpan.textContent = `as ${nick}`;
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+    connected = true;
+    myNickname = nick;
+    addChatMessage('system', '', `✅ Connected as ${nick}`);
+  } else if (status === 'connecting') {
+    badge.classList.add('status-connecting');
+    badge.textContent = '⏳ Connecting...';
+    nickSpan.textContent = 'Connecting...';
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = true;
+  } else {
+    badge.classList.add('status-disconnected');
+    badge.textContent = '❌ Disconnected';
+    nickSpan.textContent = 'Not connected';
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+    connected = false;
+    myNickname = '';
+    channels = {};
+    dms = {};
+    currentChannel = null;
+    currentDM = null;
+    updateChannelList();
+    updateDMList();
+    updateNickList(null, []);
+    addChatMessage('system', '', 'Disconnected from server');
+  }
+}
+
+function updateNickList(channel, nicks) {
+  const container = document.getElementById('nicklistContent');
+  const userCount = document.getElementById('userCount');
+  const nickCount = document.getElementById('nickCount');
+
+  if (!channel || !nicks || nicks.length === 0) {
+    container.innerHTML = '<div class="nick-item">(No users online)</div>';
+    userCount.textContent = '0 users';
+    nickCount.textContent = '0';
+    return;
+  }
+
+  container.innerHTML = '';
+
+  // Sort nicks: ops first, then voiced, then regular
+  const sortedNicks = [...nicks].sort((a, b) => {
+    const prefixOrder = { '~': 0, '&': 1, '@': 2, '%': 3, '+': 4 };
+    const prefixA = a[0] in prefixOrder ? prefixOrder[a[0]] : 5;
+    const prefixB = b[0] in prefixOrder ? prefixOrder[b[0]] : 5;
+    return prefixA - prefixB;
+  });
+
+  sortedNicks.forEach(nick => {
+    const nickInfo = parseNickPrefix(nick);
+    const div = document.createElement('div');
+    div.className = 'nick-item';
+    div.title = nickInfo.title;
+
+    if (nickInfo.class) {
+      div.innerHTML = `
+        <span class="nick-prefix ${nickInfo.class}">${nickInfo.display}</span>
+        <span>${nickInfo.cleanNick}</span>
+      `;
+    } else {
+      div.textContent = nick;
+    }
+
+    div.onclick = () => {
+      const cleanNick = nickInfo.cleanNick;
+      if (cleanNick !== myNickname) {
+        const input = document.getElementById('messageInput');
+        input.value = `/whois ${cleanNick}`;
+        input.focus();
+      }
+    };
+    container.appendChild(div);
+  });
+
+  userCount.textContent = `${nicks.length} users`;
+  nickCount.textContent = nicks.length;
+}
+
+function updateChannelList() {
+  const container = document.getElementById('channelList');
+  const channelCount = document.getElementById('channelCount');
+
+  if (Object.keys(channels).length === 0) {
+    container.innerHTML = '<div class="channel-item"><span>Not in any channels</span></div>';
+    channelCount.textContent = '0';
+    return;
+  }
+
+  container.innerHTML = '';
+  Object.keys(channels).forEach(channel => {
+    const users = channels[channel].nicks ? channels[channel].nicks.length : 0;
+    const div = document.createElement('div');
+    div.className = 'channel-item';
+    if (channel === currentChannel && !currentDM) {
+      div.classList.add('active');
+    }
+    div.innerHTML = `
+      <span>${channel}</span>
+      <span class="channel-users">${users} users</span>
+    `;
+    div.onclick = () => switchToChannel(channel);
+    container.appendChild(div);
+  });
+
+  channelCount.textContent = Object.keys(channels).length;
+}
+
+function updateDMList() {
+  const container = document.getElementById('dmList');
+
+  if (Object.keys(dms).length === 0) {
+    container.innerHTML = '<div style="padding:8px;color:#888;font-style:italic;font-size:12px;">No private messages yet</div>';
+    return;
+  }
+
+  container.innerHTML = '';
+  Object.keys(dms).forEach(nick => {
+    const unread = dms[nick].unread || 0;
+    const div = document.createElement('div');
+    div.className = 'dm-item';
+    if (currentDM === nick) {
+      div.classList.add('active');
+      dms[nick].unread = 0;
+    }
+    if (unread > 0 && currentDM !== nick) {
+      div.classList.add('dm-unread');
+    }
+    div.innerHTML = `
+      <span>${nick}</span>
+      ${unread > 0 && currentDM !== nick ? `<span class="dm-unread">${unread}</span>` : ''}
+    `;
+    div.onclick = () => switchToDM(nick);
+    container.appendChild(div);
+  });
+}
+
+function switchToChannel(channel) {
+  if (!channel || !channels[channel]) return;
+
+  currentChannel = channel;
+  currentDM = null;
+  document.getElementById('currentChannel').textContent = `${channel} 💬`;
+  updateChannelList();
+  updateDMList();
+
+  const chatContent = document.getElementById('chatContent');
+  chatContent.innerHTML = '';
+
+  if (channels[channel] && channels[channel].messages) {
+    channels[channel].messages.forEach(msg => {
+      addChatMessage('normal', msg.sender, msg.message, msg.user_host, msg.raw_message);
+    });
+  }
+
+  if (channels[channel] && channels[channel].nicks) {
+    updateNickList(channel, channels[channel].nicks);
+  } else {
+    updateNickList(channel, []);
+  }
+
+  addChatMessage('system', '', `Switched to ${channel}`);
+}
+
+function switchToDM(nick) {
+  if (!nick || !dms[nick]) return;
+
+  currentChannel = null;
+  currentDM = nick;
+  document.getElementById('currentChannel').textContent = `💌 ${nick}`;
+  updateChannelList();
+  updateDMList();
+
+  // Mark as read
+  dms[nick].unread = 0;
+
+  const chatContent = document.getElementById('chatContent');
+  chatContent.innerHTML = '';
+
+  if (dms[nick].messages) {
+    dms[nick].messages.forEach(msg => {
+      addChatMessage('pm', msg.sender, msg.message, '', msg.raw_message);
+    });
+  }
+
+  updateNickList(null, []);
+  addChatMessage('system', '', `Private conversation with ${nick}`);
+}
+
+function displayWhois(data) {
+  if (!data) return;
+
+  const container = document.getElementById('chatContent');
+  const whoisBox = document.createElement('div');
+  whoisBox.className = 'whois-box';
+
+  let html = `<div class="whois-title">WHOIS Info for ${data.nick}</div>`;
+
+  if (data.type === 'whois_user' && data.user) {
+    html += `<div class="whois-line"><span class="whois-label">User:</span> ${data.user}@${data.host}</div>`;
+    if (data.realname) {
+      html += `<div class="whois-line"><span class="whois-label">Realname:</span> ${data.realname}</div>`;
+    }
+  } else if (data.type === 'whois_account') {
+    html += `<div class="whois-line"><span class="whois-label">Account:</span> ${data.account} (Registered)</div>`;
+  } else if (data.type === 'whois_idle') {
+    html += `<div class="whois-line"><span class="whois-label">Idle:</span> ${data.idle_minutes} minutes</div>`;
+    html += `<div class="whois-line"><span class="whois-label">Signed on:</span> ${data.signon_time}</div>`;
+  } else if (data.type === 'whois_end' && data.data) {
+    const info = data.data;
+    if (info.whois.user) {
+      html += `<div class="whois-line"><span class="whois-label">User:</span> ${info.whois.user}@${info.whois.host}</div>`;
+    }
+    if (info.whois.realname) {
+      html += `<div class="whois-line"><span class="whois-label">Realname:</span> ${info.whois.realname}</div>`;
+    }
+    if (info.server) {
+      html += `<div class="whois-line"><span class="whois-label">Server:</span> ${info.server}</div>`;
+    }
+    if (info.account) {
+      html += `<div class="whois-line"><span class="whois-label">Account:</span> ${info.account}</div>`;
+    }
+    if (info.idle) {
+      const idleMin = Math.floor(parseInt(info.idle) / 60);
+      html += `<div class="whois-line"><span class="whois-label">Idle:</span> ${idleMin} minutes</div>`;
+    }
+    if (info.signon) {
+      try {
+        const signonTime = new Date(parseInt(info.signon) * 1000);
+        html += `<div class="whois-line"><span class="whois-label">Signed on:</span> ${signonTime.toLocaleString()}</div>`;
+      } catch (e) {}
+    }
+    if (info.channels && info.channels.length > 0) {
+      html += `<div class="whois-line"><span class="whois-label">Channels:</span> ${info.channels.join(' ')}</div>`;
+    }
+    if (info.bot) {
+      html += `<div class="whois-line"><span class="whois-label">Status:</span> Bot</div>`;
+    }
+    if (info.secure) {
+      html += `<div class="whois-line"><span class="whois-label">Connection:</span> Secure</div>`;
+    }
+    if (info.location) {
+      html += `<div class="whois-line"><span class="whois-label">Location:</span> ${info.location}</div>`;
+    }
+  }
+
+  whoisBox.innerHTML = html;
+
+  // Add to chat
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'message-time';
+  timeSpan.textContent = formatTime();
+
+  const msgDiv = document.createElement('div');
+  msgDiv.className = 'chat-message system';
+  msgDiv.appendChild(timeSpan);
+  msgDiv.appendChild(whoisBox);
+
+  container.appendChild(msgDiv);
+  container.scrollTop = container.scrollHeight;
+}
+
+// ====== SOCKET.IO HANDLERS ======
+function connectSocket() {
+  if (socket && socket.connected) {
+    return;
+  }
+
+  socket = io();
+
+  socket.on('connect', () => {
+    console.log('WebSocket connected');
+    addChatMessage('system', '', 'Connected to WebSocket server');
+  });
+
+  socket.on('irc_event', (data) => {
+    console.log('IRC Event:', data.type);
+    handleIrcEvent(data.type, data.payload);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('WebSocket disconnected');
+    updateStatus('disconnected');
+  });
+}
+
+function handleIrcEvent(type, payload) {
+  switch(type) {
+    case 'IRC_STATUS':
+      if (payload.status === 'connected') {
+        updateStatus('connected', payload.nick);
+      } else if (payload.status === 'connecting') {
+        updateStatus('connecting');
+      } else if (payload.status === 'disconnected') {
+        updateStatus('disconnected');
+      } else if (payload.status === 'error') {
+        addChatMessage('system', '', `❌ Error: ${payload.message}`);
+      }
+      break;
+
+    case 'IRC_MESSAGE':
+      if (payload.type === 'channel') {
+        const channel = payload.channel;
+        if (!channels[channel]) {
+          channels[channel] = { nicks: [], messages: [], topic: '' };
+        }
+
+        const msg = {
+          sender: payload.sender,
+          user_host: payload.user_host,
+          message: payload.message,
+          raw_message: payload.raw_message,
+          time: payload.timestamp
+        };
+
+        if (!channels[channel].messages) channels[channel].messages = [];
+        channels[channel].messages.push(msg);
+
+        if (channel === currentChannel && !currentDM) {
+          addChatMessage('normal', payload.sender, payload.message, payload.user_host, payload.raw_message);
+        }
+      }
+      break;
+
+    case 'IRC_PM':
+      if (payload.type === 'pm_received') {
+        const sender = payload.sender;
+        if (!dms[sender]) {
+          dms[sender] = { messages: [], unread: 0 };
+        }
+
+        const msg = {
+          sender: sender,
+          message: payload.message,
+          raw_message: payload.raw_message,
+          time: payload.timestamp,
+          is_self: false
+        };
+
+        dms[sender].messages.push(msg);
+
+        if (currentDM === sender) {
+          addChatMessage('pm', sender, payload.message, '', payload.raw_message);
+        } else {
+          dms[sender].unread = (dms[sender].unread || 0) + 1;
+          updateDMList();
+        }
+      } else if (payload.type === 'pm_sent') {
+        const target = payload.target;
+        if (!dms[target]) {
+          dms[target] = { messages: [], unread: 0 };
+        }
+
+        const msg = {
+          sender: myNickname,
+          message: payload.message,
+          raw_message: payload.message,
+          time: payload.timestamp,
+          is_self: true
+        };
+
+        dms[target].messages.push(msg);
+
+        if (currentDM === target) {
+          addChatMessage('pm', myNickname, payload.message);
+        }
+      }
+      break;
+
+    case 'IRC_JOIN':
+      const joinChannel = payload.channel;
+      if (channels[joinChannel]) {
+        if (!channels[joinChannel].nicks.includes(payload.nick)) {
+          channels[joinChannel].nicks.push(payload.nick);
+        }
+        if (joinChannel === currentChannel && !currentDM) {
+          addChatMessage('join', payload.nick, '', payload.user_host);
+        }
+      }
+      break;
+
+    case 'IRC_PART':
+      const partChannel = payload.channel;
+      if (channels[partChannel]) {
+        const idx = channels[partChannel].nicks.indexOf(payload.nick);
+        if (idx > -1) {
+          channels[partChannel].nicks.splice(idx, 1);
+        }
+        if (partChannel === currentChannel && !currentDM) {
+          addChatMessage('part', payload.nick, '', payload.user_host);
+        }
+      }
+      break;
+
+    case 'IRC_QUIT':
+      Object.keys(channels).forEach(channel => {
+        const idx = channels[channel].nicks.indexOf(payload.nick);
+        if (idx > -1) {
+          channels[channel].nicks.splice(idx, 1);
+          if (channel === currentChannel && !currentDM) {
+            addChatMessage('quit', payload.nick, payload.message || '', payload.user_host);
+          }
+        }
+      });
+      break;
+
+    case 'IRC_NICK_CHANGE':
+      Object.keys(channels).forEach(channel => {
+        const idx = channels[channel].nicks.indexOf(payload.old_nick);
+        if (idx > -1) {
+          channels[channel].nicks[idx] = payload.new_nick;
+        }
+      });
+
+      if (payload.old_nick === myNickname) {
+        myNickname = payload.new_nick;
+      }
+
+      addChatMessage('system', '', `${payload.old_nick} is now known as ${payload.new_nick}`);
+      break;
+
+    case 'IRC_CHANNEL_ADD':
+      if (!channels[payload.channel]) {
+        channels[payload.channel] = { nicks: [myNickname], messages: [], topic: payload.topic || '' };
+        updateChannelList();
+
+        if (!currentChannel && !currentDM) {
+          switchToChannel(payload.channel);
+        } else {
+          addChatMessage('system', '', `✅ Joined ${payload.channel}`);
+        }
+      }
+      break;
+
+    case 'IRC_NICKLIST':
+      if (!channels[payload.channel]) {
+        channels[payload.channel] = { nicks: [], messages: [], topic: '' };
+      }
+
+      channels[payload.channel].nicks = payload.nicks;
+      updateChannelList();
+
+      if (payload.channel === currentChannel && !currentDM) {
+        updateNickList(payload.channel, payload.nicks);
+      }
+      break;
+
+    case 'IRC_TOPIC':
+      if (channels[payload.channel]) {
+        channels[payload.channel].topic = payload.topic;
+        if (payload.channel === currentChannel && !currentDM) {
+          addChatMessage('system', '', `Topic: ${payload.topic}`);
+        }
+      }
+      break;
+
+    case 'IRC_WHOIS':
+      displayWhois(payload);
+      break;
+
+    case 'IRC_ERROR':
+      addChatMessage('system', '', `❌ ${payload.message}`);
+      break;
+  }
+}
+
+// ====== UI FUNCTIONS ======
+function connectIRC() {
+  if (connected) {
+    addChatMessage('system', '', 'Already connected!');
+    return;
+  }
+
+  connectSocket();
+  updateStatus('connecting');
+  addChatMessage('system', '', 'Connecting to IRC server...');
+
+  fetch('/api/irc/connect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  })
+  .then(response => response.json())
+  .then(data => {
+    if (data.status === 'ok') {
+      addChatMessage('system', '', 'IRC connection initiated...');
+    }
+  })
+  .catch(error => {
+    addChatMessage('system', '', `Connection error: ${error}`);
+    updateStatus('disconnected');
+  });
+}
+
+function disconnectIRC() {
+  if (!connected) return;
+
+  fetch('/api/irc/disconnect', { method: 'POST' })
+  .then(() => {
+    updateStatus('disconnected');
+  });
+}
+
+function sendMessage() {
+  const input = document.getElementById('messageInput');
+  const text = input.value.trim();
+
+  if (!text) return;
+
+  if (!connected) {
+    addChatMessage('system', '', 'Please connect first!');
+    input.value = '';
+    return;
+  }
+
+  if (text.startsWith('/')) {
+    const cmd = text.substring(1);
+    if (cmd.toLowerCase().startsWith('msg ') || cmd.toLowerCase().startsWith('privmsg ')) {
+      const parts = cmd.split(' ');
+      if (parts.length >= 3) {
+        const target = parts[1];
+        const message = parts.slice(2).join(' ');
+        fetch('/api/irc/pm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target: target, message: message })
+        });
+
+        addChatMessage('pm', myNickname, message);
+        input.value = '';
+        return;
+      }
+    }
+
+    fetch('/api/irc/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: text })
+    })
+    .then(response => response.json())
+    .then(data => {
+      if (data.status === 'sent') {
+        addChatMessage('system', '', `Command sent: ${text}`);
+      }
+    });
+  } else {
+    if (currentDM) {
+      // Send private message
+      fetch('/api/irc/pm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: currentDM, message: text })
+      });
+
+      addChatMessage('pm', myNickname, text);
+    } else if (currentChannel) {
+      // Send channel message
+      fetch('/api/irc/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          target: currentChannel, 
+          message: text 
+        })
+      });
+
+      addChatMessage('me', myNickname, text);
+    } else {
+      addChatMessage('system', '', 'Join a channel or start a DM first!');
+    }
+  }
+
+  input.value = '';
+  input.focus();
+}
+
+function joinChannel() {
+  const channel = prompt('Enter channel name (e.g., #kampung):');
+  if (channel) {
+    doJoinChannel(channel);
+  }
+}
+
+function quickJoin() {
+  const input = document.getElementById('joinChannelInput');
+  const channel = input.value.trim();
+
+  if (!channel) return;
+
+  doJoinChannel(channel);
+  input.value = '';
+}
+
+function doJoinChannel(channel) {
+  if (!channel.startsWith('#')) {
+    channel = '#' + channel;
+  }
+
+  addChatMessage('system', '', `Joining ${channel}...`);
+
+  fetch('/api/irc/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command: `/join ${channel}` })
+  });
+}
+
+function leaveChannel() {
+  if (currentChannel) {
+    fetch('/api/irc/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: `/part ${currentChannel}` })
+    });
+    addChatMessage('system', '', `Leaving ${currentChannel}...`);
+  }
+}
+
+function startDM() {
+  const input = document.getElementById('dmInput');
+  const nick = input.value.trim();
+
+  if (!nick) return;
+
+  if (nick === myNickname) {
+    addChatMessage('system', '', 'Cannot start DM with yourself!');
+    return;
+  }
+
+  switchToDM(nick);
+  input.value = '';
+  document.getElementById('messageInput').focus();
+}
+
+// ====== RESIZER LOGIC ======
+const resizer = document.getElementById("resizer");
+const root = document.documentElement;
+let dragging = false;
+
+const saved = localStorage.getItem("leftWidth");
+if(saved){
+  root.style.setProperty("--left-width", saved + "px");
+}
+
+const startDrag = () => {
+  dragging = true;
+  document.body.style.cursor = "col-resize";
+};
+const stopDrag = () => {
+  dragging = false;
+  document.body.style.cursor = "default";
+};
+const drag = x => {
+  const min = 220;
+  const max = 420;
+  let w = x;
+  if(w < min) w = min;
+  if(w > max) w = max;
+  root.style.setProperty("--left-width", w + "px");
+  localStorage.setItem("leftWidth", w);
+};
+
+resizer.addEventListener("mousedown", startDrag);
+document.addEventListener("mousemove", e => dragging && drag(e.clientX));
+document.addEventListener("mouseup", stopDrag);
+
+resizer.addEventListener("touchstart", startDrag);
+document.addEventListener("touchmove", e => {
+  if(dragging) drag(e.touches[0].clientX);
+});
+document.addEventListener("touchend", stopDrag);
+
+resizer.addEventListener("dblclick",()=>{
+  root.style.setProperty("--left-width","260px");
+  localStorage.removeItem("leftWidth");
+});
+
+// Theme toggle
+document.getElementById("toggleMode").onclick = () => {
+  document.body.classList.toggle("light");
+  const btn = document.getElementById("toggleMode");
+  btn.textContent = document.body.classList.contains("light") ? "🌙" : "☀️";
+
+  if (document.body.classList.contains("light")) {
+    root.style.setProperty('--bg-dark', '#f5f5f5');
+    root.style.setProperty('--bg-darker', '#e0e0e0');
+    root.style.setProperty('--bg-medium', '#ffffff');
+    root.style.setProperty('--bg-light', '#f9f9f9');
+    root.style.setProperty('--border', '#ddd');
+    root.style.setProperty('--text', '#333');
+  } else {
+    root.style.setProperty('--bg-dark', '#1e1e1e');
+    root.style.setProperty('--bg-darker', '#111');
+    root.style.setProperty('--bg-medium', '#252525');
+    root.style.setProperty('--bg-light', '#2a2a2a');
+    root.style.setProperty('--border', '#444');
+    root.style.setProperty('--text', '#fff');
+  }
+};
+
+// Handle Enter key
+document.getElementById('messageInput').onkeypress = (e) => {
+  if (e.key === 'Enter') {
+    sendMessage();
+  }
+};
+
+// Initialize
+connectSocket();
+updateTime();
+updateStatus('disconnected');
+
+// Button event listeners
+document.getElementById('connectBtn').onclick = connectIRC;
+document.getElementById('disconnectBtn').onclick = disconnectIRC;
+</script>
+
+</body>
+</html>
+'''
+
+# ============================================================================
+# PART 3: FLASK ROUTES (FIXED)
+# ============================================================================
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/irc/connect', methods=['POST'])
+def api_irc_connect():
+    global irc_client, irc_thread
+
+    if irc_client and irc_client.connected:
+        irc_client.disconnect()
+        time.sleep(1)
+
+    irc_client = IRCClient()
+
+    def web_callback(event_type, payload):
+        socketio.emit('irc_event', {
+            'type': event_type,
+            'payload': payload
+        })
+
+    irc_client.set_web_callback(web_callback)
+
+    def connect_thread():
+        irc_client.connect()
+        while irc_client.connected:
+            time.sleep(1)
+
+    irc_thread = threading.Thread(target=connect_thread)
+    irc_thread.daemon = True
+    irc_thread.start()
+
+    return jsonify({'status': 'ok', 'message': 'IRC connection started'})
+
+@app.route('/api/irc/disconnect', methods=['POST'])
+def api_irc_disconnect():
+    global irc_client
+
+    if irc_client and irc_client.connected:
+        irc_client.disconnect()
+        return jsonify({'status': 'ok', 'message': 'Disconnected'})
+
+    return jsonify({'status': 'error', 'message': 'Not connected'})
+
+@app.route('/api/irc/command', methods=['POST'])
+def api_irc_command():
+    global irc_client
+
+    if not irc_client or not irc_client.connected:
+        return jsonify({'status': 'error', 'message': 'Not connected to IRC'}), 400
+
+    data = request.json
+    command = data.get('command', '').strip()
+
+    print(f"[API] Command: {command}")
+
+    if command.startswith('/'):
+        cmd_parts = command[1:].split(' ', 1)
+        cmd = cmd_parts[0].lower()
+        args = cmd_parts[1] if len(cmd_parts) > 1 else ""
+
+        if cmd == 'nick' and args:
+            irc_client.change_nick(args)
+        elif cmd == 'join' and args:
+            irc_client.join_channel(args)
+        elif cmd == 'part':
+            channel = args if args else '#general'
+            irc_client.part_channel(channel)
+        elif cmd == 'whois' and args:
+            irc_client.whois(args)
+        elif cmd == 'names' and args:
+            irc_client._send(f"NAMES {args}")
+        elif cmd == 'quit':
+            irc_client.disconnect()
+        else:
+            irc_client._send(command[1:])
+    else:
+        if irc_client.channels:
+            first_channel = list(irc_client.channels.keys())[0]
+            irc_client.send_message(first_channel, command)
+        else:
+            irc_client.send_message('#general', command)
+
+    return jsonify({'status': 'sent', 'command': command})
+
+@app.route('/api/irc/message', methods=['POST'])
+def api_irc_message():
+    global irc_client
+
+    if not irc_client or not irc_client.connected:
+        return jsonify({'status': 'error', 'message': 'Not connected'}), 400
+
+    data = request.json
+    target = data.get('target', '')
+    message = data.get('message', '')
+
+    if target and message:
+        irc_client.send_message(target, message)
+        return jsonify({'status': 'sent'})
+
+    return jsonify({'status': 'error', 'message': 'Invalid data'}), 400
+
+@app.route('/api/irc/pm', methods=['POST'])
+def api_irc_pm():
+    """Send private message"""
+    global irc_client
+
+    if not irc_client or not irc_client.connected:
+        return jsonify({'status': 'error', 'message': 'Not connected'}), 400
+
+    data = request.json
+    target = data.get('target', '')
+    message = data.get('message', '')
+
+    if target and message:
+        success = irc_client.send_private_message(target, message)
+        if success:
+            return jsonify({'status': 'sent'})
+
+    return jsonify({'status': 'error', 'message': 'Invalid data'}), 400
+
+@app.route('/api/irc/debug', methods=['GET'])
+def api_irc_debug():
+    global irc_client
+
+    if not irc_client:
+        return jsonify({
+            'status': 'no_client',
+            'connected': False,
+            'registered': False,
+            'channels': [],
+            'nick': None
+        })
+
+    return jsonify({
+        'status': 'ok',
+        'connected': irc_client.connected,
+        'registered': irc_client.registered,
+        'channels': list(irc_client.channels.keys()),
+        'nick': irc_client.nick,
+        'pm_users': list(irc_client.private_messages.keys())
+    })
+
+# ============================================================================
+# PART 4: MAIN ENTRY POINT
+# ============================================================================
+
+if __name__ == '__main__':
+    print("\n" + "="*70)
+    print("🚀 KAMPUNGCHAT IRC - FIXED VERSION")
+    print("="*70)
+    print("FIXES IMPLEMENTED:")
+    print("  1. ✓ WHOIS command working")
+    print("  2. ✓ User prefixes fixed (~ & @ % +)")
+    print("  3. ✓ Channel history preserved")
+    print("  4. ✓ PM/DM functionality added")
+    print("  5. ✓ Radio URL updated: https://radio.kcfm.org")
+    print("="*70)
+    print("\nAccess at: http://localhost:5000")
+    print("\nPress Ctrl+C to stop")
+    print("="*70)
+
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
